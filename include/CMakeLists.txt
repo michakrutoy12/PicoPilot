@@ -1,0 +1,6 @@
+add_subdirectory(bme280)
+add_subdirectory(gps)
+add_subdirectory(mpu6500)
+add_subdirectory(acs712)
+add_subdirectory(SensorFusion)
+add_subdirectory(control)
