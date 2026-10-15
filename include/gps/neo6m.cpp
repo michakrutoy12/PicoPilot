@@ -11,7 +11,7 @@ namespace {
         return (ec == std::errc{}) ? val : default_val;
     }
 
-    double to_double(std::string_view sv, double default_val = 0.0f) {
+    double to_double(std::string_view sv, double default_val = 0.0) {
         if (sv.empty()) return default_val;
         double val;
         auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), val);
@@ -23,6 +23,26 @@ namespace {
         long val;
         auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), val, base);
         return (ec == std::errc{}) ? val : default_val;
+    }
+
+    double parse_coordinate(std::string_view value_field, std::string_view hemisphere_field) {
+        if (value_field.empty()) return 0.0;
+
+        const double value = to_double(value_field);
+        if (!std::isfinite(value)) return 0.0;
+
+        const double degrees = std::floor(value / 100.0);
+        const double minutes = value - degrees * 100.0;
+        double coord = degrees + (minutes / 60.0);
+
+        if (!hemisphere_field.empty()) {
+            const char hemi = hemisphere_field[0];
+            if (hemi == 'S' || hemi == 'W') {
+                coord = -coord;
+            }
+        }
+
+        return coord;
     }
 }
 
@@ -77,9 +97,9 @@ void Neo6M::parse_line(std::string_view line) {
         process_gga(line);
     } else if (line.find("RMC") != std::string_view::npos) {
         process_rmc(line);
-    } // else if (line.find("VTG") != std::string_view::npos) {
-      //     process_vtg(line);
-      // }
+    } else if (line.find("VTG") != std::string_view::npos) {
+        process_vtg(line);
+    }
 }
 
 std::string_view Neo6M::get_field(std::string_view line, int field_index) {
@@ -104,40 +124,48 @@ std::string_view Neo6M::get_field(std::string_view line, int field_index) {
 
 void Neo6M::process_gga(std::string_view line) {
     std::string_view s_lat = get_field(line, 2);
+    std::string_view s_lat_hem = get_field(line, 3);
     std::string_view s_lon = get_field(line, 4);
+    std::string_view s_lon_hem = get_field(line, 5);
     std::string_view s_fix = get_field(line, 6);
     std::string_view s_sat = get_field(line, 7);
     std::string_view s_hdop = get_field(line, 8);
     std::string_view s_alt = get_field(line, 9);
 
     if (!s_lat.empty()) {
-        double raw_lat = to_double(s_lat);
-        int lat_deg = (int)(raw_lat / 100);
-        double lat_min = raw_lat - (lat_deg * 100);
-        latitude = lat_deg + (lat_min / 60.0);
+        latitude = parse_coordinate(s_lat, s_lat_hem);
     }
-    
-    if (!s_lon.empty()){
-        double raw_lon = to_double(s_lon);
-        int lon_deg = (int)(raw_lon / 100);
-        double lon_min = raw_lon - (lon_deg * 100);
-        longitude = lon_deg + (lon_min / 60.0);
+
+    if (!s_lon.empty()) {
+        longitude = parse_coordinate(s_lon, s_lon_hem);
     }
-    
+
     if (!s_fix.empty())  fix_state = to_long(s_fix);
     if (!s_sat.empty())  satellites = to_long(s_sat);
     if (!s_hdop.empty()) hdop = to_float(s_hdop);
     if (!s_alt.empty())  altitude = to_float(s_alt);
-    
+
     data_updated = true;
 }
 
 void Neo6M::process_rmc(std::string_view line) {
+    std::string_view s_lat = get_field(line, 3);
+    std::string_view s_lat_hem = get_field(line, 4);
+    std::string_view s_lon = get_field(line, 5);
+    std::string_view s_lon_hem = get_field(line, 6);
     std::string_view s_date = get_field(line, 9);
     std::string_view s_time = get_field(line, 1);
     std::string_view s_speed = get_field(line, 7);
     std::string_view s_course = get_field(line, 8);
     std::string_view s_status = get_field(line, 2);
+
+    if (!s_lat.empty()) {
+        latitude = parse_coordinate(s_lat, s_lat_hem);
+    }
+
+    if (!s_lon.empty()) {
+        longitude = parse_coordinate(s_lon, s_lon_hem);
+    }
 
     if (s_status != "A") {
         course_valid = false;
@@ -158,12 +186,27 @@ void Neo6M::process_rmc(std::string_view line) {
     } else {
         course_valid = false;
     }
+
+    data_updated = true;
 }
 
 void Neo6M::process_vtg(std::string_view line) {
-    std::string_view s_speed = get_field(line, 7);
-    if (!s_speed.empty()) {
-        speed = to_float(s_speed);
-        data_updated = true;
+    std::string_view s_course = get_field(line, 1);
+    std::string_view s_speed_kmh = get_field(line, 7);
+
+    if (!s_course.empty()) {
+        const float course_deg = to_float(s_course, std::numeric_limits<float>::quiet_NaN());
+        course_valid = std::isfinite(course_deg) && course_deg >= 0.0f && course_deg <= 360.0f;
+        if (course_valid) {
+            constexpr float degrees_to_radians = 0.01745329251994329577f;
+            course = course_deg * degrees_to_radians;
+            course_timestamp_us = time_us_32();
+        }
     }
+
+    if (!s_speed_kmh.empty()) {
+        speed = to_float(s_speed_kmh) / 3.6f;
+    }
+
+    data_updated = true;
 }
