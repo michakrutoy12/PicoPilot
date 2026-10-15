@@ -15,6 +15,7 @@ public:
     float hdop = 0.0f;
     float course = 0.0f;
     bool course_valid = false;
+    uint32_t course_timestamp_us = 0;
 
     uint gps_time = 0;
     uint gps_date = 0;

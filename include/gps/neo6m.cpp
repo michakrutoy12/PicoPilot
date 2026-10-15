@@ -53,6 +53,26 @@ bool Neo6M::update(char c) {
 void Neo6M::parse_line(std::string_view line) {
     if (line.empty() || line[0] != '$') return;
 
+    const size_t checksum_separator = line.find('*');
+    if (checksum_separator == std::string_view::npos ||
+        checksum_separator + 3 != line.size()) return;
+
+    auto hex_value = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        return -1;
+    };
+    const int checksum_high = hex_value(line[checksum_separator + 1]);
+    const int checksum_low = hex_value(line[checksum_separator + 2]);
+    if (checksum_high < 0 || checksum_low < 0) return;
+
+    uint8_t checksum = 0;
+    for (size_t i = 1; i < checksum_separator; ++i) {
+        checksum ^= static_cast<uint8_t>(line[i]);
+    }
+    if (checksum != static_cast<uint8_t>((checksum_high << 4) | checksum_low)) return;
+
     if (line.find("GGA") != std::string_view::npos) {
         process_gga(line);
     } else if (line.find("RMC") != std::string_view::npos) {
@@ -133,6 +153,7 @@ void Neo6M::process_rmc(std::string_view line) {
         if (course_valid) {
             constexpr float degrees_to_radians = 0.01745329251994329577f;
             course = course_deg * degrees_to_radians;
+            course_timestamp_us = time_us_32();
         }
     } else {
         course_valid = false;

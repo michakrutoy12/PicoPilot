@@ -96,6 +96,7 @@ struct RawSensorData {
     uint32_t imu_timestamp_us;
     uint32_t baro_timestamp_us;
     uint32_t gps_timestamp_us;
+    uint32_t course_timestamp_us;
 
     Vector3f accel;
     Vector3f gyro;
@@ -421,6 +422,9 @@ void core1_entry() {
     uint32_t last_baro_timestamp_us = 0;
     uint32_t last_gps_timestamp_us = 0;
     uint32_t loop_counter = 0;
+    uint32_t last_accel_update_us = 0;
+    uint8_t consecutive_accel_updates = 0;
+    uint32_t last_altitude_measurement_us = 0;
 
     while (true) {
         ++core1_heartbeat;
@@ -468,7 +472,8 @@ void core1_entry() {
 
             if (sensors.course_valid && sensors.gps_fix_valid &&
                 std::isfinite(sensors.speed) && sensors.speed >= 1.0f &&
-                (uint32_t)(time_us_32() - sensors.gps_timestamp_us) <= 1500000u) {
+                sensors.course_timestamp_us != 0 &&
+                (uint32_t)(time_us_32() - sensors.course_timestamp_us) <= 1500000u) {
                 ekf.correctYawDrift(sensors.course, sensors.speed, dt);
             }
 
@@ -478,8 +483,12 @@ void core1_entry() {
                 if (!ekf.set_r_accel(adapted_r)) {
                     attitude_update_valid = false;
                 } else {
-                    attitude_update_valid =
-                        ekf.updateAccel(accel_corr.x, accel_corr.y, accel_corr.z);
+                    if (ekf.updateAccel(accel_corr.x, accel_corr.y, accel_corr.z)) {
+                        last_accel_update_us = time_us_32();
+                        if (consecutive_accel_updates < 10) ++consecutive_accel_updates;
+                    } else {
+                        consecutive_accel_updates = 0;
+                    }
                 }
             }
         }
@@ -491,7 +500,9 @@ void core1_entry() {
             if (dt_baro > 0.0f && dt_baro < 0.5f) {
                 float raw_altitude;
                 if (Variometer::pressure_to_altitude(sensors.pressure, raw_altitude)) {
-                    variometer.update_baro(raw_altitude);
+                    if (variometer.update_baro(raw_altitude)) {
+                        last_altitude_measurement_us = time_us_32();
+                    }
                 }
             }
         }
@@ -503,15 +514,23 @@ void core1_entry() {
             if (sensors.gps_fix_valid && std::isfinite(sensors.hdop) &&
                 sensors.hdop > 0.0f && sensors.hdop < 2.0f &&
                 dt_gps > 0.0f && dt_gps < 2.0f) {
-                variometer.update_gps(sensors.gps_altitude, sensors.hdop * 2.0f);
+                if (variometer.update_gps(sensors.gps_altitude)) {
+                    last_altitude_measurement_us = time_us_32();
+                }
             }
         }
 
         ekf.getQuaternion(ekf_result.q1, ekf_result.q2, ekf_result.q3, ekf_result.q4);
         ekf_result.altitude = variometer.get_altitude();
         ekf_result.vertical_speed = variometer.get_vertical_speed();
-        ekf_result.attitude_valid = attitude_update_valid;
-        ekf_result.altitude_valid = variometer.is_initialized();
+        const uint32_t result_timestamp_us = time_us_32();
+        ekf_result.attitude_valid =
+            attitude_update_valid && consecutive_accel_updates >= 10 &&
+            last_accel_update_us != 0 &&
+            (uint32_t)(result_timestamp_us - last_accel_update_us) <= 100000u;
+        ekf_result.altitude_valid =
+            variometer.is_initialized() && last_altitude_measurement_us != 0 &&
+            (uint32_t)(result_timestamp_us - last_altitude_measurement_us) <= 250000u;
 
         loop_counter++;
         send_ekf_to_core0(ekf_result);
@@ -573,6 +592,7 @@ void core0_entry() {
                 }
 
                 current_sensors.gps_timestamp_us = time_us_32();
+                current_sensors.course_timestamp_us = gps.course_timestamp_us;
                 current_sensors.gps_altitude = gps.altitude;
                 current_sensors.speed = gps.speed;
                 current_sensors.course = gps.course;

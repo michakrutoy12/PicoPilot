@@ -73,19 +73,19 @@ public:
         return std::isfinite(altitude_m);
     }
 
-    void update_baro(float baro_alt, float r_baro = 0.25f) {
+    bool update_baro(float baro_alt, float r_baro = 0.25f) {
         if (!std::isfinite(baro_alt) ||
             !std::isfinite(r_baro) || r_baro <= 0.0f ||
-            std::abs(baro_alt) > 20000.0f) return;
+            std::abs(baro_alt) > 20000.0f) return false;
         if (!state_is_finite()) {
             reset();
-            return;
+            return false;
         }
 
         if (!initialized_) {
             x_[0] = baro_alt;
             initialized_ = true;
-            return;
+            return true;
         }
 
         float z_hat = x_[0] + x_[2];
@@ -96,7 +96,7 @@ public:
         float M2 = P02_ + P22_;
 
         float S = M0 + M2 + r_baro;
-        if (!std::isfinite(S) || S <= 1e-9f || !std::isfinite(y)) return;
+        if (!std::isfinite(S) || S <= 1e-9f || !std::isfinite(y)) return false;
 
         float inv_S = 1.0f / S;
         float K0 = M0 * inv_S;
@@ -113,36 +113,39 @@ public:
         P11_ -= K1 * M1;
         P12_ -= K1 * M2;
         P22_ -= K2 * M2;
-        if (!state_is_finite()) reset();
-    }
-
-    void update_gps(float gps_alt, float vdop = 1.0f) {
-        if (!std::isfinite(gps_alt) ||
-            !std::isfinite(vdop) || vdop <= 0.0f ||
-            std::abs(gps_alt) > 20000.0f) return;
         if (!state_is_finite()) {
             reset();
-            return;
+            return false;
+        }
+        return true;
+    }
+
+    bool update_gps(float gps_alt, float altitude_variance = 25.0f) {
+        if (!std::isfinite(gps_alt) ||
+            !std::isfinite(altitude_variance) || altitude_variance <= 0.0f ||
+            std::abs(gps_alt) > 20000.0f) return false;
+        if (!state_is_finite()) {
+            reset();
+            return false;
         }
 
         if (!initialized_) {
             x_[0] = gps_alt;
             initialized_ = true;
-            return;
+            return true;
         }
 
         float z_hat = x_[0];
         float y = gps_alt - z_hat;
 
-        float v25 = 2.5f * vdop;
-        float r_gps = v25 * v25;
+        float r_gps = altitude_variance;
 
         float M0 = P00_;
         float M1 = P01_;
         float M2 = P02_;
 
         float S = M0 + r_gps;
-        if (!std::isfinite(S) || S <= 1e-9f || !std::isfinite(y) || !std::isfinite(r_gps)) return;
+        if (!std::isfinite(S) || S <= 1e-9f || !std::isfinite(y) || !std::isfinite(r_gps)) return false;
 
         float inv_S = 1.0f / S;
         float K0 = M0 * inv_S;
@@ -159,7 +162,11 @@ public:
         P11_ -= K1 * M1;
         P12_ -= K1 * M2;
         P22_ -= K2 * M2;
-        if (!state_is_finite()) reset();
+        if (!state_is_finite()) {
+            reset();
+            return false;
+        }
+        return true;
     }
 
     float get_altitude()       const { return x_[0]; }
@@ -174,8 +181,8 @@ private:
     float P11_, P12_;
     float P22_;
 
-    float q_accel_sq_;
-    float q_baro_drift_sq_;
+    float q_accel_sq_ = 0.64f;
+    float q_baro_drift_sq_ = 0.000025f;
     bool initialized_ = false;
 
     bool state_is_finite() const {

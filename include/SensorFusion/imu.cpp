@@ -88,6 +88,8 @@ bool ExtendedKalmanFilter::predict(float gx, float gy, float gz, float dt) {
     x[1] += 0.5f * ( q0*wx - q3*wy + q2*wz) * dt;
     x[2] += 0.5f * ( q3*wx + q0*wy - q1*wz) * dt;
     x[3] += 0.5f * (-q2*wx + q1*wy + q0*wz) * dt;
+    const float predicted_norm_sq = x[0]*x[0] + x[1]*x[1] + x[2]*x[2] + x[3]*x[3];
+    const float predicted_norm = std::sqrt(predicted_norm_sq);
     if (!normalizeQuaternion()) return false;
 
     float F[7][7];
@@ -103,6 +105,18 @@ bool ExtendedKalmanFilter::predict(float gx, float gy, float gz, float dt) {
     F[2][4] = -0.5f*q3*dt; F[2][5] = -0.5f*q0*dt; F[2][6] =  0.5f*q1*dt;
     F[3][4] =  0.5f*q2*dt; F[3][5] = -0.5f*q1*dt; F[3][6] = -0.5f*q0*dt;
 
+    float F_raw[4][7];
+    std::memcpy(F_raw, F, sizeof(F_raw));
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 7; j++) {
+            F[i][j] = 0.0f;
+            for (int k = 0; k < 4; k++) {
+                const float normalization_jacobian =
+                    ((i == k ? 1.0f : 0.0f) - x[i] * x[k]) / predicted_norm;
+                F[i][j] += normalization_jacobian * F_raw[k][j];
+            }
+        }
+    }
 
     float FP[7][7];
     for (int i = 0; i < 4; i++) {
@@ -131,7 +145,21 @@ bool ExtendedKalmanFilter::predict(float gx, float gy, float gz, float dt) {
         }
     }
 
-    for (int i = 0; i < 4; i++) P[i][i] += Q_gyro * dt;
+    const float G[4][3] = {
+        {-0.5f*q1, -0.5f*q2, -0.5f*q3},
+        { 0.5f*q0, -0.5f*q3,  0.5f*q2},
+        { 0.5f*q3,  0.5f*q0, -0.5f*q1},
+        {-0.5f*q2,  0.5f*q1,  0.5f*q0}
+    };
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            float gyro_noise_covariance = 0.0f;
+            for (int k = 0; k < 3; k++) {
+                gyro_noise_covariance += G[i][k] * G[j][k];
+            }
+            P[i][j] += Q_gyro * dt * gyro_noise_covariance;
+        }
+    }
     for (int i = 4; i < 7; i++) P[i][i] += Q_bias * dt;
     if (!stateIsFinite()) {
         reset();
@@ -144,7 +172,7 @@ bool ExtendedKalmanFilter::updateAccel(float ax, float ay, float az) {
     float normSq = ax*ax + ay*ay + az*az;
     if (!std::isfinite(ax) || !std::isfinite(ay) || !std::isfinite(az) ||
         !std::isfinite(normSq)) return false;
-    if (normSq < 25.0f || normSq > 225.0f) return true;
+    if (normSq < 25.0f || normSq > 225.0f) return false;
     if (!stateIsFinite()) {
         reset();
         return false;
@@ -212,6 +240,8 @@ bool ExtendedKalmanFilter::updateAccel(float ax, float ay, float az) {
     for (int i = 0; i < 7; i++) {
         x[i] += K[i][0]*z_y[0] + K[i][1]*z_y[1] + K[i][2]*z_y[2];
     }
+    const float corrected_norm_sq = x[0]*x[0] + x[1]*x[1] + x[2]*x[2] + x[3]*x[3];
+    const float corrected_norm = std::sqrt(corrected_norm_sq);
     if (!normalizeQuaternion()) return false;
 
     float P_prior[7][7];
@@ -248,7 +278,40 @@ bool ExtendedKalmanFilter::updateAccel(float ax, float ay, float az) {
             }
         }
     }
-    std::memcpy(P, updatedP, sizeof(P));
+    float normalization_jacobian[4][4];
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            normalization_jacobian[i][j] =
+                ((i == j ? 1.0f : 0.0f) - x[i] * x[j]) / corrected_norm;
+        }
+    }
+
+    float normalization_transform[7][7] = {};
+    for (int i = 0; i < 7; i++) normalization_transform[i][i] = 1.0f;
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            normalization_transform[i][j] = normalization_jacobian[i][j];
+        }
+    }
+
+    float transformedP[7][7] = {};
+    for (int i = 0; i < 7; i++) {
+        for (int j = 0; j < 7; j++) {
+            for (int k = 0; k < 7; k++) {
+                transformedP[i][j] += normalization_transform[i][k] * updatedP[k][j];
+            }
+        }
+    }
+
+    float normalizedP[7][7] = {};
+    for (int i = 0; i < 7; i++) {
+        for (int j = 0; j < 7; j++) {
+            for (int k = 0; k < 7; k++) {
+                normalizedP[i][j] += transformedP[i][k] * normalization_transform[j][k];
+            }
+        }
+    }
+    std::memcpy(P, normalizedP, sizeof(P));
     if (!stateIsFinite()) {
         reset();
         return false;
