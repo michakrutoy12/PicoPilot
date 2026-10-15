@@ -68,8 +68,7 @@ CentripetalConfig compensator_config;
 const Vector3f lever_arm_m = {0.17f, 0.03f, 0.0f};
 
 #pragma pack(push, 1)
-struct TelemetryPacket
-{
+struct TelemetryPacket {
     uint8_t header1 = 0xAA;
     uint8_t header2 = 0x55;
 
@@ -92,8 +91,7 @@ struct TelemetryPacket
 };
 #pragma pack(pop)
 
-struct RawSensorData
-{
+struct RawSensorData {
     uint32_t imu_timestamp_us;
     uint32_t baro_timestamp_us;
     uint32_t gps_timestamp_us;
@@ -111,8 +109,7 @@ struct RawSensorData
     uint8_t satellites;
 };
 
-struct EKFOutput
-{
+struct EKFOutput {
     float q1 = 1.0f, q2 = 0.0f, q3 = 0.0f, q4 = 0.0f;
     float vertical_speed = 0.0f;
     float altitude = 0.0f;
@@ -237,7 +234,8 @@ void init_telemetry_dma() {
         &uart_get_hw(UART)->dr,
         NULL,
         0,
-        false);
+        false
+    );
 }
 
 void send_sensors_to_core1(const RawSensorData &data) {
@@ -289,18 +287,14 @@ void ppm_handler() {
     interruptTime = time_us_64();
     uint16_t pulseLength = (uint16_t)(interruptTime - previousTime);
 
-    if (pulseLength > PAUSE_PULSE_MIN_LENGTH && pulseLength < PAUSE_PULSE_MAX_LENGTH)
-    {
-        if (pulses_nr == N_CHANNELS)
-        {
+    if (pulseLength > PAUSE_PULSE_MIN_LENGTH && pulseLength < PAUSE_PULSE_MAX_LENGTH) {
+        if (pulses_nr == N_CHANNELS) {
             last_valid_ppm_us = interruptTime;
         }
         pulses_nr = 0;
     }
-    else
-    {
-        if (pulses_nr < N_CHANNELS)
-        {
+    else {
+        if (pulses_nr < N_CHANNELS) {
             pulses[pulses_nr] = pulseLength;
             pulses_nr++;
         }
@@ -452,7 +446,8 @@ void core1_entry() {
             dt,
             sensors.speed,
             accel_corr,
-            adapted_r);
+            adapted_r
+        );
 
         ekf.set_r_accel(adapted_r);
         ekf.correctYawDrift(sensors.course, sensors.speed, dt);
