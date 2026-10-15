@@ -35,12 +35,12 @@ bool MPU6500::begin() {
     return true;
 }
 
-void MPU6500::read_data() {
+bool MPU6500::read_data() {
     uint8_t reg = REG_ACCEL_XOUT_H;
     uint8_t buffer[14];
 
-    if (i2c_write_timeout_us(_i2c, _address, &reg, 1, true, 1000) == PICO_ERROR_TIMEOUT) return;
-    if (i2c_read_timeout_us(_i2c, _address, buffer, 14, false, 1000) == PICO_ERROR_TIMEOUT) return;
+    if (i2c_write_timeout_us(_i2c, _address, &reg, 1, true, 1000) != 1) return false;
+    if (i2c_read_timeout_us(_i2c, _address, buffer, 14, false, 1000) != 14) return false;
 
     int16_t raw_ax = (buffer[0] << 8) | buffer[1];
     int16_t raw_ay = (buffer[2] << 8) | buffer[3];
@@ -61,6 +61,7 @@ void MPU6500::read_data() {
     gx = static_cast<float>(raw_gy) * GYRO_SCALE;
     gy = static_cast<float>(raw_gx) * GYRO_SCALE;
     gz = static_cast<float>(raw_gz) * GYRO_SCALE;
+    return true;
 }
 
 float MPU6500::setSampleRate(uint16_t hz) {

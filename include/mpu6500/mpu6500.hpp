@@ -5,14 +5,14 @@
 
 class MPU6500 {
 public:
-    float ax, ay, az;
-    float temp;
-    float gx, gy, gz;
+    float ax = 0.0f, ay = 0.0f, az = 0.0f;
+    float temp = 0.0f;
+    float gx = 0.0f, gy = 0.0f, gz = 0.0f;
 
     MPU6500(i2c_inst_t* i2c, uint8_t address = 0x68);
 
     bool begin();
-    void read_data();
+    bool read_data();
     float setSampleRate(uint16_t hz);
 
 private:

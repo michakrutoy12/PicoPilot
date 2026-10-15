@@ -1,5 +1,7 @@
 #include "neo6m.hpp"
 #include <pico/stdlib.h>
+#include <cmath>
+#include <limits>
 
 namespace {
     float to_float(std::string_view sv, float default_val = 0.0f) {
@@ -118,16 +120,22 @@ void Neo6M::process_rmc(std::string_view line) {
     std::string_view s_status = get_field(line, 2);
 
     if (s_status != "A") {
+        course_valid = false;
         return;
     }
 
-    if (!s_speed.empty()) speed = to_float(s_speed) * 0.514f; 
+    if (!s_speed.empty()) speed = to_float(s_speed) * 0.514f;
     if (s_time.length() >= 6) gps_time = to_long(s_time);
     if (s_date.length() == 6) gps_date = to_long(s_date);
     if (!s_course.empty()) {
-        course = to_float(s_course);
+        const float course_deg = to_float(s_course, std::numeric_limits<float>::quiet_NaN());
+        course_valid = std::isfinite(course_deg) && course_deg >= 0.0f && course_deg <= 360.0f;
+        if (course_valid) {
+            constexpr float degrees_to_radians = 0.01745329251994329577f;
+            course = course_deg * degrees_to_radians;
+        }
     } else {
-        course = 0.0f;
+        course_valid = false;
     }
 }
 

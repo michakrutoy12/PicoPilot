@@ -14,6 +14,7 @@
 #include "hardware/adc.h"
 #include "hardware/irq.h"
 #include "hardware/pwm.h"
+#include "hardware/watchdog.h"
 
 #include "mpu6500.hpp"
 #include "bme280.hpp"
@@ -105,6 +106,8 @@ struct RawSensorData {
     float gps_altitude;
     float speed;
     float course;
+    bool course_valid;
+    bool gps_fix_valid;
     float hdop;
     uint8_t satellites;
 };
@@ -113,6 +116,8 @@ struct EKFOutput {
     float q1 = 1.0f, q2 = 0.0f, q3 = 0.0f, q4 = 0.0f;
     float vertical_speed = 0.0f;
     float altitude = 0.0f;
+    bool attitude_valid = false;
+    bool altitude_valid = false;
 };
 
 double home_lat = 0.0, home_lon = 0.0;
@@ -127,6 +132,7 @@ spin_lock_t *ekf_lock;
 
 volatile bool imu_data_ready = false;
 uint32_t imu_irq_timestamp_us = 0;
+volatile uint32_t core1_heartbeat = 0;
 
 /* PPM */
 volatile bool sync_stop = true;
@@ -417,6 +423,11 @@ void core1_entry() {
     uint32_t loop_counter = 0;
 
     while (true) {
+        ++core1_heartbeat;
+        if (!multicore_fifo_rvalid()) {
+            sleep_ms(1);
+            continue;
+        }
         multicore_fifo_pop_blocking();
         multicore_fifo_drain();
         sensors = get_sensors_on_core1();
@@ -429,33 +440,48 @@ void core1_entry() {
         float dt = (float)(sensors.imu_timestamp_us - last_imu_timestamp_us) / 1000000.0f;
         last_imu_timestamp_us = sensors.imu_timestamp_us;
 
-        if (dt <= 0.0f || dt > 0.02f) {
-            dt = 0.0025f;
-        }
+        const bool imu_dt_valid = std::isfinite(dt) && dt > 0.0f && dt <= 0.02f;
+        const bool imu_data_valid =
+            std::isfinite(sensors.gyro.x) && std::isfinite(sensors.gyro.y) &&
+            std::isfinite(sensors.gyro.z) && std::isfinite(sensors.accel.x) &&
+            std::isfinite(sensors.accel.y) && std::isfinite(sensors.accel.z);
+        bool attitude_update_valid = imu_dt_valid && imu_data_valid;
 
-        float bx, by, bz;
-        ekf.getGyroBias(bx, by, bz);
-        gyro_clean = {
-            sensors.gyro.x - bx,
-            sensors.gyro.y - by,
-            sensors.gyro.z - bz};
+        if (imu_dt_valid) variometer.predict(dt);
 
-        compensator.process(
-            sensors.accel,
-            gyro_clean,
-            dt,
-            sensors.speed,
-            accel_corr,
-            adapted_r
-        );
+        if (attitude_update_valid) {
+            float bx, by, bz;
+            ekf.getGyroBias(bx, by, bz);
+            gyro_clean = {
+                sensors.gyro.x - bx,
+                sensors.gyro.y - by,
+                sensors.gyro.z - bz};
 
-        ekf.set_r_accel(adapted_r);
-        ekf.correctYawDrift(sensors.course, sensors.speed, dt);
+            compensator.process(
+                sensors.accel,
+                gyro_clean,
+                dt,
+                sensors.speed,
+                accel_corr,
+                adapted_r
+            );
 
-        ekf.predict(gyro_clean.x, gyro_clean.y, gyro_clean.z, dt);
+            if (sensors.course_valid && sensors.gps_fix_valid &&
+                std::isfinite(sensors.speed) && sensors.speed >= 1.0f &&
+                (uint32_t)(time_us_32() - sensors.gps_timestamp_us) <= 1500000u) {
+                ekf.correctYawDrift(sensors.course, sensors.speed, dt);
+            }
 
-        if (loop_counter % 2 == 0) {
-            ekf.updateAccel(accel_corr.x, accel_corr.y, accel_corr.z);
+            attitude_update_valid = ekf.predict(gyro_clean.x, gyro_clean.y, gyro_clean.z, dt);
+
+            if (attitude_update_valid && loop_counter % 2 == 0) {
+                if (!ekf.set_r_accel(adapted_r)) {
+                    attitude_update_valid = false;
+                } else {
+                    attitude_update_valid =
+                        ekf.updateAccel(accel_corr.x, accel_corr.y, accel_corr.z);
+                }
+            }
         }
 
         if (sensors.baro_timestamp_us != last_baro_timestamp_us) {
@@ -463,8 +489,10 @@ void core1_entry() {
             last_baro_timestamp_us = sensors.baro_timestamp_us;
 
             if (dt_baro > 0.0f && dt_baro < 0.5f) {
-                float raw_altitude = Variometer::pressure_to_altitude(sensors.pressure);
-                variometer.update_baro(raw_altitude, dt_baro);
+                float raw_altitude;
+                if (Variometer::pressure_to_altitude(sensors.pressure, raw_altitude)) {
+                    variometer.update_baro(raw_altitude);
+                }
             }
         }
 
@@ -472,14 +500,18 @@ void core1_entry() {
             float dt_gps = (float)(sensors.gps_timestamp_us - last_gps_timestamp_us) / 1000000.0f;
             last_gps_timestamp_us = sensors.gps_timestamp_us;
 
-            if (sensors.hdop < 2.0f && dt_gps > 0.0f && dt_gps < 2.0f) {
-                variometer.update_gps(sensors.gps_altitude, dt_gps, sensors.hdop * 2.0f);
+            if (sensors.gps_fix_valid && std::isfinite(sensors.hdop) &&
+                sensors.hdop > 0.0f && sensors.hdop < 2.0f &&
+                dt_gps > 0.0f && dt_gps < 2.0f) {
+                variometer.update_gps(sensors.gps_altitude, sensors.hdop * 2.0f);
             }
         }
 
         ekf.getQuaternion(ekf_result.q1, ekf_result.q2, ekf_result.q3, ekf_result.q4);
         ekf_result.altitude = variometer.get_altitude();
         ekf_result.vertical_speed = variometer.get_vertical_speed();
+        ekf_result.attitude_valid = attitude_update_valid;
+        ekf_result.altitude_valid = variometer.is_initialized();
 
         loop_counter++;
         send_ekf_to_core0(ekf_result);
@@ -500,6 +532,9 @@ void core0_entry() {
     const uint32_t TELEMETRY_INTERVAL_US = 200000;
 
     uint32_t last_control_time_us = time_us_32();
+    uint32_t last_valid_imu_us = last_control_time_us;
+    uint32_t last_watchdog_check_us = last_control_time_us;
+    uint32_t observed_core1_heartbeat = core1_heartbeat;
 
     float target_altitude_m = 0.0f;
     bool altitude_hold_captured = false;
@@ -507,7 +542,24 @@ void core0_entry() {
 
     while (true) {
         uint32_t now_us = time_us_32();
+        if (now_us - last_watchdog_check_us >= 100000u) {
+            last_watchdog_check_us = now_us;
+            const uint32_t current_core1_heartbeat = core1_heartbeat;
+            if (current_core1_heartbeat != observed_core1_heartbeat) {
+                watchdog_update();
+            }
+            observed_core1_heartbeat = current_core1_heartbeat;
+        }
+
         bool signal_ok = (now_us - last_valid_ppm_us) < MAX_NO_SIGNAL_TIME && signal_power > SIGNAL_POWER_THRESHOLD;
+
+        if (now_us - last_valid_imu_us > 50000u) {
+            set_pwm(THROTTLE_PIN, 1040);
+            set_pwm(ROLL_PIN, 1500);
+            set_pwm(PITCH_PIN, 1500);
+            set_pwm(YAW_PIN, 1500);
+            altitude_hold_captured = false;
+        }
 
         char c;
         while (gps_ring_buffer.pop(c)) {
@@ -524,6 +576,8 @@ void core0_entry() {
                 current_sensors.gps_altitude = gps.altitude;
                 current_sensors.speed = gps.speed;
                 current_sensors.course = gps.course;
+                current_sensors.course_valid = gps.course_valid;
+                current_sensors.gps_fix_valid = gps.fix_state > 0 && gps.satellites >= 4;
                 current_sensors.hdop = gps.hdop;
                 current_sensors.satellites = gps.satellites;
                 current_sensors.lat = gps.latitude;
@@ -537,14 +591,16 @@ void core0_entry() {
 
         if (now_us - last_bme_read_us >= BME_READ_INTERVAL_US) {
             last_bme_read_us = now_us;
-            bme.update_pressure();
-            current_sensors.baro_timestamp_us = now_us;
-            current_sensors.pressure = bme.get_pressure();
+            if (bme.update_pressure()) {
+                current_sensors.baro_timestamp_us = now_us;
+                current_sensors.pressure = bme.get_pressure();
+            }
         }
 
         if (imu_data_ready) {
             imu_data_ready = false;
-            imu.read_data();
+            if (!imu.read_data()) continue;
+            last_valid_imu_us = time_us_32();
 
             current_sensors.accel = {imu.ax, imu.ay, imu.az};
             current_sensors.gyro = {imu.gx, imu.gy, imu.gz};
@@ -563,7 +619,8 @@ void core0_entry() {
 
             uint16_t mode_channel = pulses[4];
 
-            if (!signal_ok) {
+            if (!signal_ok ||
+                (pulses[4] >= 1500 && (!ekf.attitude_valid || !ekf.altitude_valid))) {
                 set_pwm(THROTTLE_PIN, 1040);
                 set_pwm(ROLL_PIN, 1500);
                 set_pwm(PITCH_PIN, 1500);
@@ -586,7 +643,7 @@ void core0_entry() {
                 }
 
                 float sin_pitch = 2.0f * (ekf.q1 * ekf.q3 - ekf.q2 * ekf.q4);
-                float v_dot_imu = (imu.ax * 9.80665f) - 9.80665f * sin_pitch;
+                float v_dot_imu = imu.ax - 9.80665f * sin_pitch;
                 v_dot_filtered += 0.1f * (v_dot_imu - v_dot_filtered);
 
                 Avionics::TECSInputs tecs_in;
@@ -626,6 +683,7 @@ void core0_entry() {
 }
 
 int main() {
+    watchdog_enable(1000, true);
     compensator_config.lever_arm_m = lever_arm_m;
 
     hardware_init();

@@ -1,27 +1,17 @@
 #include "imu.hpp"
 #include <cmath>
 #include <cstring>
-#include <cstdint>
 #include <algorithm>
 
-#include <cstring>
-
-inline float fastInvSqrt(float x) {
-    if (x <= 1e-12f || !std::isfinite(x)) return 0.0f;
-
-    float halfx = 0.5f * x;
-    float y = x;
-    uint32_t i;
-    std::memcpy(&i, &y, sizeof(i));
-    i = 0x5f3759df - (i >> 1);
-    std::memcpy(&y, &i, sizeof(y));
-    y = y * (1.5f - (halfx * y * y));
-    return y;
+namespace {
+float fastInvSqrt(float x) {
+    if (!std::isfinite(x) || x <= 1e-12f) return 0.0f;
+    return 1.0f / std::sqrt(x);
+}
 }
 
 ExtendedKalmanFilter::ExtendedKalmanFilter() {
-    reset();
-    init(0.005f, 0.00001f, 0.015f);
+    if (!init(0.005f, 0.00001f, 0.015f)) reset();
 }
 
 void ExtendedKalmanFilter::reset() {
@@ -33,25 +23,61 @@ void ExtendedKalmanFilter::reset() {
     for (int i = 4; i < 7; i++) P[i][i] = 0.001f;
 }
 
-void ExtendedKalmanFilter::init(float gyroNoise, float biasNoise, float accelNoise) {
+bool ExtendedKalmanFilter::init(float gyroNoise, float biasNoise, float accelNoise) {
+    if (!std::isfinite(gyroNoise) || gyroNoise < 0.0f ||
+        !std::isfinite(biasNoise) || biasNoise < 0.0f ||
+        !std::isfinite(accelNoise) || accelNoise <= 0.0f ||
+        gyroNoise > 1e6f || biasNoise > 1e6f || accelNoise > 1e6f) {
+        return false;
+    }
+
     Q_gyro = gyroNoise;
     Q_bias = biasNoise;
     R_accel = accelNoise;
+    reset();
+    return true;
 }
 
-void ExtendedKalmanFilter::set_r_accel(float r_accel){
+bool ExtendedKalmanFilter::set_r_accel(float r_accel){
+    if (!std::isfinite(r_accel) || r_accel <= 0.0f || r_accel > 1e6f) return false;
     R_accel = r_accel;
+    return true;
 }
 
-void ExtendedKalmanFilter::normalizeQuaternion() {
-    float normSq = x[0]*x[0] + x[1]*x[1] + x[2]*x[2] + x[3]*x[3];
-    if (normSq > 0.0f) {
-        float invNorm = fastInvSqrt(normSq);
-        x[0] *= invNorm; x[1] *= invNorm; x[2] *= invNorm; x[3] *= invNorm;
+bool ExtendedKalmanFilter::stateIsFinite() const {
+    for (float value : x) {
+        if (!std::isfinite(value)) return false;
     }
+    for (const auto& row : P) {
+        for (float value : row) {
+            if (!std::isfinite(value)) return false;
+        }
+    }
+    return true;
 }
 
-void ExtendedKalmanFilter::predict(float gx, float gy, float gz, float dt) {
+bool ExtendedKalmanFilter::normalizeQuaternion() {
+    float normSq = x[0]*x[0] + x[1]*x[1] + x[2]*x[2] + x[3]*x[3];
+    float invNorm = fastInvSqrt(normSq);
+    if (invNorm == 0.0f) {
+        reset();
+        return false;
+    }
+
+    x[0] *= invNorm; x[1] *= invNorm; x[2] *= invNorm; x[3] *= invNorm;
+    return true;
+}
+
+bool ExtendedKalmanFilter::predict(float gx, float gy, float gz, float dt) {
+    if (!std::isfinite(gx) || !std::isfinite(gy) || !std::isfinite(gz) ||
+        !std::isfinite(dt) || dt <= 0.0f || dt > 0.02f) {
+        return false;
+    }
+    if (!stateIsFinite()) {
+        reset();
+        return false;
+    }
+
     float wx = gx - x[4];
     float wy = gy - x[5];
     float wz = gz - x[6];
@@ -62,7 +88,7 @@ void ExtendedKalmanFilter::predict(float gx, float gy, float gz, float dt) {
     x[1] += 0.5f * ( q0*wx - q3*wy + q2*wz) * dt;
     x[2] += 0.5f * ( q3*wx + q0*wy - q1*wz) * dt;
     x[3] += 0.5f * (-q2*wx + q1*wy + q0*wz) * dt;
-    normalizeQuaternion();
+    if (!normalizeQuaternion()) return false;
 
     float F[7][7];
     std::memset(F, 0, sizeof(F));
@@ -107,13 +133,25 @@ void ExtendedKalmanFilter::predict(float gx, float gy, float gz, float dt) {
 
     for (int i = 0; i < 4; i++) P[i][i] += Q_gyro * dt;
     for (int i = 4; i < 7; i++) P[i][i] += Q_bias * dt;
+    if (!stateIsFinite()) {
+        reset();
+        return false;
+    }
+    return true;
 }
 
-void ExtendedKalmanFilter::updateAccel(float ax, float ay, float az) {
+bool ExtendedKalmanFilter::updateAccel(float ax, float ay, float az) {
     float normSq = ax*ax + ay*ay + az*az;
-    if (normSq < 25.0f || normSq > 225.0f) return;
+    if (!std::isfinite(ax) || !std::isfinite(ay) || !std::isfinite(az) ||
+        !std::isfinite(normSq)) return false;
+    if (normSq < 25.0f || normSq > 225.0f) return true;
+    if (!stateIsFinite()) {
+        reset();
+        return false;
+    }
     
     float invNorm = fastInvSqrt(normSq);
+    if (invNorm == 0.0f) return false;
     ax *= invNorm; ay *= invNorm; az *= invNorm;
 
     float q0 = x[0], q1 = x[1], q2 = x[2], q3 = x[3];
@@ -148,8 +186,8 @@ void ExtendedKalmanFilter::updateAccel(float ax, float ay, float az) {
                 S[0][1] * (S[1][0] * S[2][2] - S[1][2] * S[2][0]) +
                 S[0][2] * (S[1][0] * S[2][1] - S[1][1] * S[2][0]);
 
-    if (!std::isfinite(det) || std::abs(det) < 1e-6f) {
-        return;
+    if (!std::isfinite(det) || det <= 1e-12f) {
+        return false;
     }
     float invDet = 1.0f / det;
 
@@ -174,20 +212,48 @@ void ExtendedKalmanFilter::updateAccel(float ax, float ay, float az) {
     for (int i = 0; i < 7; i++) {
         x[i] += K[i][0]*z_y[0] + K[i][1]*z_y[1] + K[i][2]*z_y[2];
     }
-    normalizeQuaternion();
+    if (!normalizeQuaternion()) return false;
 
-    float KH[7][4]; 
-    for (int i = 0; i < 7; i++) {
-        for (int j = 0; j < 4; j++) {
-            KH[i][j] = K[i][0]*H[0][j] + K[i][1]*H[1][j] + K[i][2]*H[2][j];
-        }
-    }
+    float P_prior[7][7];
+    std::memcpy(P_prior, P, sizeof(P_prior));
 
+    float A[7][7];
     for (int i = 0; i < 7; i++) {
         for (int j = 0; j < 7; j++) {
-            P[i][j] -= KH[i][0]*P[0][j] + KH[i][1]*P[1][j] + KH[i][2]*P[2][j] + KH[i][3]*P[3][j];
+            float kh = 0.0f;
+            if (j < 4) {
+                kh = K[i][0]*H[0][j] + K[i][1]*H[1][j] + K[i][2]*H[2][j];
+            }
+            A[i][j] = (i == j ? 1.0f : 0.0f) - kh;
         }
     }
+
+    float AP[7][7] = {};
+    for (int i = 0; i < 7; i++) {
+        for (int j = 0; j < 7; j++) {
+            for (int k = 0; k < 7; k++) {
+                AP[i][j] += A[i][k] * P_prior[k][j];
+            }
+        }
+    }
+
+    float updatedP[7][7] = {};
+    for (int i = 0; i < 7; i++) {
+        for (int j = 0; j < 7; j++) {
+            for (int k = 0; k < 7; k++) {
+                updatedP[i][j] += AP[i][k] * A[j][k];
+            }
+            for (int k = 0; k < 3; k++) {
+                updatedP[i][j] += K[i][k] * R_accel * K[j][k];
+            }
+        }
+    }
+    std::memcpy(P, updatedP, sizeof(P));
+    if (!stateIsFinite()) {
+        reset();
+        return false;
+    }
+    return true;
 }
 
 void ExtendedKalmanFilter::getQuaternion(float& q0, float& q1, float& q2, float& q3) const {
@@ -208,7 +274,11 @@ void ExtendedKalmanFilter::getEulerAngles(float& roll, float& pitch, float& yaw)
 }
 
 void ExtendedKalmanFilter::correctYawDrift(float gpsCourseRad, float gpsSpeed, float dt, float K_drift) {
-    if (gpsSpeed < 1.0f || std::isnan(gpsCourseRad)) return; 
+    if (!std::isfinite(gpsCourseRad) || !std::isfinite(gpsSpeed) ||
+        !std::isfinite(dt) || !std::isfinite(K_drift) ||
+        gpsSpeed < 1.0f || dt <= 0.0f || dt > 0.02f ||
+        gpsCourseRad < 0.0f || gpsCourseRad > 6.2831855f ||
+        K_drift < 0.0f || K_drift > 1.0f || !stateIsFinite()) return;
 
     float q0 = x[0], q1 = x[1], q2 = x[2], q3 = x[3];
 
@@ -225,4 +295,5 @@ void ExtendedKalmanFilter::correctYawDrift(float gpsCourseRad, float gpsSpeed, f
     x[4] -= K_drift * error_yaw * z_x * dt;
     x[5] -= K_drift * error_yaw * z_y * dt;
     x[6] -= K_drift * error_yaw * z_z * dt;
+    if (!stateIsFinite()) reset();
 }
