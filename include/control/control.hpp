@@ -87,6 +87,7 @@ public:
     FlightController();
 
     void updateGPSCourse(float target_course_rad, float gps_course_rad, float ground_speed_m_s);
+    void clearGPSCourse();
 
     ServoOutputs updateAttitude(float dt, 
                                 const Quaternion& q_curr, 

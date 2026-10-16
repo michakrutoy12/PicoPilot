@@ -110,6 +110,10 @@ void FlightController::updateGPSCourse(float target_course_rad, float gps_course
     target_roll_rad_ = std::clamp(target_roll_rad_, -0.5236f, 0.5236f);
 }
 
+void FlightController::clearGPSCourse() {
+    target_roll_rad_ = 0.0f;
+}
+
 ServoOutputs FlightController::updateAttitude(float dt, 
                                               const Quaternion& q_curr, 
                                               const Vector3& gyro_rad_s, 

@@ -1,5 +1,8 @@
 #include "pico/stdlib.h"
 #include <cmath>
+#ifdef PICOPILOT_ENABLE_DIAGNOSTICS
+#include <cstdio>
+#endif
 #include <cstring>
 
 #include "pico/multicore.h"
@@ -65,6 +68,52 @@ BME280 bme(I2C_PORT, 0x76);
 Neo6M gps;
 RingBuffer<384> gps_ring_buffer;
 
+#ifdef PICOPILOT_ENABLE_DIAGNOSTICS
+bool imu_initialized = false;
+bool bme_initialized = false;
+bool adc_initialized = false;
+bool last_imu_read_ok = false;
+bool last_bme_read_ok = false;
+uint32_t last_bme_success_us = 0;
+uint32_t imu_read_success_count = 0;
+uint32_t imu_read_failure_count = 0;
+uint32_t bme_read_success_count = 0;
+uint32_t bme_read_failure_count = 0;
+uint32_t gps_parsed_update_count = 0;
+uint32_t telemetry_dma_started_count = 0;
+uint32_t telemetry_dma_busy_count = 0;
+volatile uint32_t imu_irq_count = 0;
+
+volatile uint32_t ppm_edge_count = 0;
+volatile uint32_t ppm_valid_frame_count = 0;
+volatile uint32_t gps_irq_count = 0;
+volatile uint32_t gps_bytes_received = 0;
+volatile uint32_t gps_ring_overflow_count = 0;
+volatile uint32_t gps_irq_timestamp_us = 0;
+volatile uint32_t core1_processed_imu_count = 0;
+volatile uint32_t ekf_predict_success_count = 0;
+volatile uint32_t ekf_predict_failure_count = 0;
+volatile uint32_t ekf_input_reject_count = 0;
+volatile uint32_t ekf_accel_update_success_count = 0;
+volatile uint32_t ekf_accel_update_failure_count = 0;
+volatile uint32_t ekf_baro_update_success_count = 0;
+volatile uint32_t ekf_baro_update_failure_count = 0;
+volatile uint32_t ekf_gps_altitude_update_success_count = 0;
+volatile uint32_t ekf_gps_altitude_update_failure_count = 0;
+volatile uint32_t ekf_yaw_correction_count = 0;
+uint16_t last_pwm_output[4] = {1040, 1500, 1500, 1500};
+const char* control_mode = "STARTING";
+bool gps_navigation_valid = false;
+float diagnostic_target_course_rad = 0.0f;
+Avionics::TECSInputs diagnostic_tecs_inputs = {};
+Avionics::TECSOutputs diagnostic_tecs_outputs = {};
+Avionics::ServoOutputs diagnostic_servo_outputs = {};
+float diagnostic_dt_ctrl = 0.0f;
+#define DIAGNOSTIC_COUNT(counter) (++(counter))
+#else
+#define DIAGNOSTIC_COUNT(counter) ((void)0)
+#endif
+
 CentripetalConfig compensator_config;
 const Vector3f lever_arm_m = {0.17f, 0.03f, 0.0f};
 
@@ -115,11 +164,124 @@ struct RawSensorData {
 
 struct EKFOutput {
     float q1 = 1.0f, q2 = 0.0f, q3 = 0.0f, q4 = 0.0f;
+    float gyro_bias_x = 0.0f, gyro_bias_y = 0.0f, gyro_bias_z = 0.0f;
     float vertical_speed = 0.0f;
     float altitude = 0.0f;
     bool attitude_valid = false;
     bool altitude_valid = false;
 };
+
+extern double home_lat, home_lon;
+extern float home_altitude;
+extern bool home_set;
+extern volatile uint16_t pulses[N_CHANNELS];
+extern volatile uint32_t last_valid_ppm_us;
+extern volatile uint32_t core1_heartbeat;
+extern volatile uint32_t imu_irq_timestamp_us;
+extern volatile bool imu_data_ready;
+extern uint16_t signal_power;
+
+#ifdef PICOPILOT_ENABLE_DIAGNOSTICS
+void print_diagnostics(const RawSensorData& sensors, const EKFOutput& ekf,
+                       bool signal_ok, uint32_t last_valid_imu_us,
+                       float target_altitude_m, bool altitude_hold_captured,
+                       float v_dot_filtered) {
+    const uint32_t now_us = time_us_32();
+    const uint32_t imu_age_us = last_valid_imu_us == 0 ? UINT32_MAX : now_us - last_valid_imu_us;
+    const uint32_t imu_irq_age_us = imu_irq_timestamp_us == 0 ? UINT32_MAX : now_us - imu_irq_timestamp_us;
+    const uint32_t bme_age_us = last_bme_success_us == 0 ? UINT32_MAX : now_us - last_bme_success_us;
+    const uint32_t gps_age_us = sensors.gps_timestamp_us == 0 ? UINT32_MAX : now_us - sensors.gps_timestamp_us;
+    const uint32_t course_age_us = sensors.course_timestamp_us == 0 ? UINT32_MAX : now_us - sensors.course_timestamp_us;
+    const uint32_t ppm_age_us = last_valid_ppm_us == 0 ? UINT32_MAX : now_us - last_valid_ppm_us;
+    const uint32_t gps_irq_age_us = gps_irq_timestamp_us == 0 ? UINT32_MAX : now_us - gps_irq_timestamp_us;
+
+    printf("\n=== DIAGNOSTICS t=%lu ms ===\n", static_cast<unsigned long>(now_us / 1000u));
+    printf("[IRQ] IMU=%lu age=%lu us pending=%s | GPS=%lu bytes=%lu age=%lu us overflow=%lu parsed=%lu ring_empty=%s"
+           " | PPM edges=%lu frames=%lu age=%lu us\n",
+           static_cast<unsigned long>(imu_irq_count), static_cast<unsigned long>(imu_irq_age_us),
+           imu_data_ready ? "YES" : "NO",
+           static_cast<unsigned long>(gps_irq_count), static_cast<unsigned long>(gps_bytes_received),
+           static_cast<unsigned long>(gps_irq_age_us), static_cast<unsigned long>(gps_ring_overflow_count),
+           static_cast<unsigned long>(gps_parsed_update_count), gps_ring_buffer.empty() ? "YES" : "NO",
+           static_cast<unsigned long>(ppm_edge_count),
+           static_cast<unsigned long>(ppm_valid_frame_count), static_cast<unsigned long>(ppm_age_us));
+
+    printf("[MPU6500] init=%s read=%s ok=%lu fail=%lu age=%lu us"
+           " accel=(%.3f, %.3f, %.3f) m/s^2 gyro=(%.5f, %.5f, %.5f) rad/s temp=%.2f C\n",
+           imu_initialized ? "OK" : "FAIL", last_imu_read_ok ? "OK" : "FAIL",
+           static_cast<unsigned long>(imu_read_success_count), static_cast<unsigned long>(imu_read_failure_count),
+           static_cast<unsigned long>(imu_age_us), imu.ax, imu.ay, imu.az, imu.gx, imu.gy, imu.gz, imu.temp);
+
+    printf("[BME280] init=%s read=%s ok=%lu fail=%lu age=%lu us"
+           " temp=%.2f C pressure=%.2f Pa humidity=%.2f %%\n",
+           bme_initialized ? "OK" : "FAIL", last_bme_read_ok ? "OK" : "FAIL",
+           static_cast<unsigned long>(bme_read_success_count), static_cast<unsigned long>(bme_read_failure_count),
+           static_cast<unsigned long>(bme_age_us), bme.get_temperature(), bme.get_pressure(), bme.get_humidity());
+
+    printf("[GPS] fix_state=%d fix_valid=%s satellites=%u HDOP=%.2f"
+           " lat=%.7f lon=%.7f altitude=%.2f m speed=%.2f m/s course=%.5f rad (%s, age=%lu us)"
+           " fix_age=%lu us"
+           " time=%u date=%u home=%s (%.7f, %.7f, %.2f m) distance=%.2f m\n",
+           gps.fix_state, sensors.gps_fix_valid ? "YES" : "NO", static_cast<unsigned>(gps.satellites), gps.hdop,
+           gps.latitude, gps.longitude, gps.altitude, gps.speed, gps.course,
+           gps.course_valid ? "VALID" : "INVALID", static_cast<unsigned long>(course_age_us),
+           static_cast<unsigned long>(gps_age_us),
+           gps.gps_time, gps.gps_date, home_set ? "SET" : "UNSET",
+           home_lat, home_lon, home_altitude, sensors.home_distance);
+
+    printf("[FUSION] core1 heartbeat=%lu processed_imu=%lu input_reject=%lu predict(ok=%lu fail=%lu)"
+           " accel_update(ok=%lu reject=%lu) baro_update(ok=%lu reject=%lu)"
+           " gps_alt_update(ok=%lu reject=%lu) yaw_correction=%lu\n",
+           static_cast<unsigned long>(core1_heartbeat), static_cast<unsigned long>(core1_processed_imu_count),
+           static_cast<unsigned long>(ekf_input_reject_count),
+           static_cast<unsigned long>(ekf_predict_success_count), static_cast<unsigned long>(ekf_predict_failure_count),
+           static_cast<unsigned long>(ekf_accel_update_success_count), static_cast<unsigned long>(ekf_accel_update_failure_count),
+           static_cast<unsigned long>(ekf_baro_update_success_count), static_cast<unsigned long>(ekf_baro_update_failure_count),
+           static_cast<unsigned long>(ekf_gps_altitude_update_success_count),
+           static_cast<unsigned long>(ekf_gps_altitude_update_failure_count),
+           static_cast<unsigned long>(ekf_yaw_correction_count));
+    printf("[EKF/ALT] attitude=%s altitude=%s q=(%.5f, %.5f, %.5f, %.5f)"
+           " gyro_bias=(%.6f, %.6f, %.6f) rad/s"
+           " altitude=%.2f m vertical_speed=%.2f m/s\n",
+           ekf.attitude_valid ? "VALID" : "INVALID", ekf.altitude_valid ? "VALID" : "INVALID",
+           ekf.q1, ekf.q2, ekf.q3, ekf.q4,
+           ekf.gyro_bias_x, ekf.gyro_bias_y, ekf.gyro_bias_z, ekf.altitude, ekf.vertical_speed);
+
+    printf("[CONTROL] mode=%s signal=%s signal_power=%u threshold=%u PPM_CH=(%u,%u,%u,%u,%u,%u)"
+           " dt=%.5f s altitude_target=%.2f m altitude_hold=%s vertical_accel=%.3f m/s^2\n",
+           control_mode, signal_ok ? "OK" : "LOST", static_cast<unsigned>(signal_power),
+           static_cast<unsigned>(SIGNAL_POWER_THRESHOLD),
+           static_cast<unsigned>(pulses[0]), static_cast<unsigned>(pulses[1]),
+           static_cast<unsigned>(pulses[2]), static_cast<unsigned>(pulses[3]),
+           static_cast<unsigned>(pulses[4]), static_cast<unsigned>(pulses[5]),
+           diagnostic_dt_ctrl, target_altitude_m, altitude_hold_captured ? "YES" : "NO", v_dot_filtered);
+    printf("[TECS/NAV] h_set=%.2f h=%.2f h_dot=%.2f v_set=%.2f v=%.2f v_dot=%.2f"
+           " throttle=%.3f pitch=%.4f rad GPS_nav=%s target_course=%.5f rad"
+           " servos=(aileron=%.3f elevator=%.3f rudder=%.3f throttle=%.3f)\n",
+           diagnostic_tecs_inputs.h_set, diagnostic_tecs_inputs.h_curr, diagnostic_tecs_inputs.h_dot_curr,
+           diagnostic_tecs_inputs.v_set, diagnostic_tecs_inputs.v_curr, diagnostic_tecs_inputs.v_dot_curr,
+           diagnostic_tecs_outputs.throttle, diagnostic_tecs_outputs.pitch_des_rad,
+           gps_navigation_valid ? "VALID" : "INVALID", diagnostic_target_course_rad,
+           diagnostic_servo_outputs.aileron, diagnostic_servo_outputs.elevator,
+           diagnostic_servo_outputs.rudder, diagnostic_servo_outputs.throttle);
+    printf("[PWM] throttle=%u roll=%u pitch=%u yaw=%u | [DMA] channel=%d busy=%s started=%lu skipped_busy=%lu\n",
+           static_cast<unsigned>(last_pwm_output[0]), static_cast<unsigned>(last_pwm_output[1]),
+           static_cast<unsigned>(last_pwm_output[2]), static_cast<unsigned>(last_pwm_output[3]),
+           telemetry_dma_chan, telemetry_dma_chan >= 0 && dma_channel_is_busy(telemetry_dma_chan) ? "YES" : "NO",
+           static_cast<unsigned long>(telemetry_dma_started_count),
+           static_cast<unsigned long>(telemetry_dma_busy_count));
+    printf("[HW] UART baud=%u I2C=%u Hz PPM_pin=%u IMU_INT_pin=%u USB_stdio=enabled\n",
+           static_cast<unsigned>(UART_BAUDRATE), 400000u,
+           static_cast<unsigned>(PPM_PIN), static_cast<unsigned>(IMU_INT_PIN));
+
+    for (uint8_t channel = 0; channel < 3; ++channel) {
+        adc_select_input(channel);
+        const uint16_t raw = adc_read();
+        printf("[ADC] GPIO%u raw=%u voltage=%.3f V\n",
+               static_cast<unsigned>(26 + channel), static_cast<unsigned>(raw), raw * (3.3f / 4095.0f));
+    }
+}
+#endif
 
 double home_lat = 0.0, home_lon = 0.0;
 float home_altitude = 0.0f;
@@ -132,7 +294,7 @@ EKFOutput global_ekf_output;
 spin_lock_t *ekf_lock;
 
 volatile bool imu_data_ready = false;
-uint32_t imu_irq_timestamp_us = 0;
+volatile uint32_t imu_irq_timestamp_us = 0;
 volatile uint32_t core1_heartbeat = 0;
 
 /* PPM */
@@ -180,6 +342,43 @@ float calculate_bearing(double lat1, double lon1, double lat2, double lon2) {
     return static_cast<float>(std::atan2(y, x));
 }
 
+bool calculate_orbit_course(double current_lat, double current_lon,
+                            double center_lat, double center_lon,
+                            float radius_m, bool clockwise,
+                            float& target_course_rad) {
+    constexpr float PI_F = 3.14159265358979323846f;
+    constexpr float TWO_PI_F = 2.0f * PI_F;
+
+    if (!std::isfinite(current_lat) || !std::isfinite(current_lon) ||
+        !std::isfinite(center_lat) || !std::isfinite(center_lon) ||
+        current_lat < -90.0 || current_lat > 90.0 ||
+        center_lat < -90.0 || center_lat > 90.0 ||
+        current_lon < -180.0 || current_lon > 180.0 ||
+        center_lon < -180.0 || center_lon > 180.0 ||
+        !std::isfinite(radius_m) || radius_m <= 0.0f) {
+        return false;
+    }
+
+    const float distance_m = calculate_distance(center_lat, center_lon, current_lat, current_lon);
+    if (!std::isfinite(distance_m) || distance_m < 0.1f) {
+        return false;
+    }
+
+    const float radial_bearing = calculate_bearing(center_lat, center_lon, current_lat, current_lon);
+    const float direction = clockwise ? 1.0f : -1.0f;
+    const float radial_correction = std::atan2(distance_m - radius_m, radius_m);
+    float course = radial_bearing + direction * (PI_F / 2.0f + radial_correction);
+    course = std::fmod(course, TWO_PI_F);
+    if (course < 0.0f) course += TWO_PI_F;
+
+    target_course_rad = course;
+    return true;
+}
+
+constexpr float HOME_ORBIT_RADIUS_M = 50.0f;
+constexpr bool HOME_ORBIT_CLOCKWISE = true;
+constexpr uint32_t GPS_NAVIGATION_TIMEOUT_US = 1500000u;
+
 uint8_t calculate_checksum(const uint8_t *data, size_t len) {
     uint8_t crc = 0x00;
     for (size_t i = 0; i < len; ++i)
@@ -191,6 +390,7 @@ uint8_t calculate_checksum(const uint8_t *data, size_t len) {
 
 void send_telemetry_dma(const RawSensorData &sensors, const EKFOutput &ekf) {
     if (dma_channel_is_busy(telemetry_dma_chan)) {
+        DIAGNOSTIC_COUNT(telemetry_dma_busy_count);
         return;
     }
 
@@ -224,6 +424,7 @@ void send_telemetry_dma(const RawSensorData &sensors, const EKFOutput &ekf) {
 
     dma_channel_set_read_addr(telemetry_dma_chan, &tx_packet_buffer, false);
     dma_channel_set_trans_count(telemetry_dma_chan, sizeof(TelemetryPacket), true);
+    DIAGNOSTIC_COUNT(telemetry_dma_started_count);
 }
 
 void init_telemetry_dma() {
@@ -290,6 +491,7 @@ float get_yaw_from_quaternion(float q1, float q2, float q3, float q4) {
 }
 
 void ppm_handler() {
+    DIAGNOSTIC_COUNT(ppm_edge_count);
     previousTime = interruptTime;
     interruptTime = time_us_64();
     uint16_t pulseLength = (uint16_t)(interruptTime - previousTime);
@@ -297,6 +499,7 @@ void ppm_handler() {
     if (pulseLength > PAUSE_PULSE_MIN_LENGTH && pulseLength < PAUSE_PULSE_MAX_LENGTH) {
         if (pulses_nr == N_CHANNELS) {
             last_valid_ppm_us = interruptTime;
+            DIAGNOSTIC_COUNT(ppm_valid_frame_count);
         }
         pulses_nr = 0;
     }
@@ -311,10 +514,17 @@ void ppm_handler() {
 void gps_handler()
 {
     uart_get_hw(UART)->icr = 0x7FF;
+    DIAGNOSTIC_COUNT(gps_irq_count);
+#ifdef PICOPILOT_ENABLE_DIAGNOSTICS
+    gps_irq_timestamp_us = time_us_32();
+#endif
 
     while (uart_is_readable(UART)) {
         char c = uart_getc(UART);
-        gps_ring_buffer.push(c);
+        DIAGNOSTIC_COUNT(gps_bytes_received);
+        if (!gps_ring_buffer.push(c)) {
+            DIAGNOSTIC_COUNT(gps_ring_overflow_count);
+        }
     }
 }
 
@@ -325,11 +535,18 @@ void gpio_callback(uint gpio, uint32_t events) {
     else if (gpio == IMU_INT_PIN) {
         imu_data_ready = true;
         imu_irq_timestamp_us = time_us_32();
+        DIAGNOSTIC_COUNT(imu_irq_count);
     }
 }
 
 void set_pwm(uint8_t gp, uint16_t duty_us) {
     pwm_set_gpio_level(gp, duty_us);
+#ifdef PICOPILOT_ENABLE_DIAGNOSTICS
+    if (gp == THROTTLE_PIN) last_pwm_output[0] = duty_us;
+    else if (gp == ROLL_PIN) last_pwm_output[1] = duty_us;
+    else if (gp == PITCH_PIN) last_pwm_output[2] = duty_us;
+    else if (gp == YAW_PIN) last_pwm_output[3] = duty_us;
+#endif
 }
 
 void init_pwm(uint8_t gp, uint16_t start_duty_ns) {
@@ -378,11 +595,22 @@ void hardware_init() {
     adc_gpio_init(26);
     adc_gpio_init(27);
     adc_gpio_init(28);
+#ifdef PICOPILOT_ENABLE_DIAGNOSTICS
+    adc_initialized = true;
+#endif
 
     gpio_init(25);
     gpio_set_dir(25, GPIO_OUT);
 
-    if (!imu.begin() || !bme.init())
+    const bool imu_ok = imu.begin();
+    const bool bme_ok = bme.init();
+#ifdef PICOPILOT_ENABLE_DIAGNOSTICS
+    imu_initialized = imu_ok;
+    bme_initialized = bme_ok;
+    printf("[INIT] MPU6500=%s BME280=%s\n",
+           imu_initialized ? "OK" : "FAIL", bme_initialized ? "OK" : "FAIL");
+#endif
+    if (!imu_ok || !bme_ok)
     {
         gpio_put(25, 1);
         while (1)
@@ -443,12 +671,16 @@ void core1_entry() {
 
         float dt = (float)(sensors.imu_timestamp_us - last_imu_timestamp_us) / 1000000.0f;
         last_imu_timestamp_us = sensors.imu_timestamp_us;
+        DIAGNOSTIC_COUNT(core1_processed_imu_count);
 
         const bool imu_dt_valid = std::isfinite(dt) && dt > 0.0f && dt <= 0.02f;
         const bool imu_data_valid =
             std::isfinite(sensors.gyro.x) && std::isfinite(sensors.gyro.y) &&
             std::isfinite(sensors.gyro.z) && std::isfinite(sensors.accel.x) &&
             std::isfinite(sensors.accel.y) && std::isfinite(sensors.accel.z);
+        if (!imu_dt_valid || !imu_data_valid) {
+            DIAGNOSTIC_COUNT(ekf_input_reject_count);
+        }
         bool attitude_update_valid = imu_dt_valid && imu_data_valid;
 
         if (imu_dt_valid) variometer.predict(dt);
@@ -475,18 +707,27 @@ void core1_entry() {
                 sensors.course_timestamp_us != 0 &&
                 (uint32_t)(time_us_32() - sensors.course_timestamp_us) <= 1500000u) {
                 ekf.correctYawDrift(sensors.course, sensors.speed, dt);
+                DIAGNOSTIC_COUNT(ekf_yaw_correction_count);
             }
 
             attitude_update_valid = ekf.predict(gyro_clean.x, gyro_clean.y, gyro_clean.z, dt);
+            if (attitude_update_valid) {
+                DIAGNOSTIC_COUNT(ekf_predict_success_count);
+            } else {
+                DIAGNOSTIC_COUNT(ekf_predict_failure_count);
+            }
 
             if (attitude_update_valid && loop_counter % 2 == 0) {
                 if (!ekf.set_r_accel(adapted_r)) {
                     attitude_update_valid = false;
+                    DIAGNOSTIC_COUNT(ekf_accel_update_failure_count);
                 } else {
                     if (ekf.updateAccel(accel_corr.x, accel_corr.y, accel_corr.z)) {
                         last_accel_update_us = time_us_32();
+                        DIAGNOSTIC_COUNT(ekf_accel_update_success_count);
                         if (consecutive_accel_updates < 10) ++consecutive_accel_updates;
                     } else {
+                        DIAGNOSTIC_COUNT(ekf_accel_update_failure_count);
                         consecutive_accel_updates = 0;
                     }
                 }
@@ -502,7 +743,12 @@ void core1_entry() {
                 if (Variometer::pressure_to_altitude(sensors.pressure, raw_altitude)) {
                     if (variometer.update_baro(raw_altitude)) {
                         last_altitude_measurement_us = time_us_32();
+                        DIAGNOSTIC_COUNT(ekf_baro_update_success_count);
+                    } else {
+                        DIAGNOSTIC_COUNT(ekf_baro_update_failure_count);
                     }
+                } else {
+                    DIAGNOSTIC_COUNT(ekf_baro_update_failure_count);
                 }
             }
         }
@@ -516,11 +762,17 @@ void core1_entry() {
                 dt_gps > 0.0f && dt_gps < 2.0f) {
                 if (variometer.update_gps(sensors.gps_altitude)) {
                     last_altitude_measurement_us = time_us_32();
+                    DIAGNOSTIC_COUNT(ekf_gps_altitude_update_success_count);
+                } else {
+                    DIAGNOSTIC_COUNT(ekf_gps_altitude_update_failure_count);
                 }
+            } else {
+                DIAGNOSTIC_COUNT(ekf_gps_altitude_update_failure_count);
             }
         }
 
         ekf.getQuaternion(ekf_result.q1, ekf_result.q2, ekf_result.q3, ekf_result.q4);
+        ekf.getGyroBias(ekf_result.gyro_bias_x, ekf_result.gyro_bias_y, ekf_result.gyro_bias_z);
         ekf_result.altitude = variometer.get_altitude();
         ekf_result.vertical_speed = variometer.get_vertical_speed();
         const uint32_t result_timestamp_us = time_us_32();
@@ -549,6 +801,10 @@ void core0_entry() {
 
     uint32_t last_telemetry_tx_us = 0;
     const uint32_t TELEMETRY_INTERVAL_US = 200000;
+#ifdef PICOPILOT_ENABLE_DIAGNOSTICS
+    uint32_t last_diagnostics_us = 0;
+    const uint32_t DIAGNOSTICS_INTERVAL_US = 1000000;
+#endif
 
     uint32_t last_control_time_us = time_us_32();
     uint32_t last_valid_imu_us = last_control_time_us;
@@ -573,6 +829,9 @@ void core0_entry() {
         bool signal_ok = (now_us - last_valid_ppm_us) < MAX_NO_SIGNAL_TIME && signal_power > SIGNAL_POWER_THRESHOLD;
 
         if (now_us - last_valid_imu_us > 50000u) {
+#ifdef PICOPILOT_ENABLE_DIAGNOSTICS
+            control_mode = "IMU_TIMEOUT";
+#endif
             set_pwm(THROTTLE_PIN, 1040);
             set_pwm(ROLL_PIN, 1500);
             set_pwm(PITCH_PIN, 1500);
@@ -583,6 +842,7 @@ void core0_entry() {
         char c;
         while (gps_ring_buffer.pop(c)) {
             if (gps.update(c)) {
+                DIAGNOSTIC_COUNT(gps_parsed_update_count);
                 if (!home_set && gps.satellites >= 4 && gps.hdop > 0.0f && gps.hdop < 3.5f && 
                     std::abs(gps.latitude) > 0.001 && std::abs(gps.longitude) > 0.001) {
                     home_lat = gps.latitude;
@@ -611,15 +871,46 @@ void core0_entry() {
 
         if (now_us - last_bme_read_us >= BME_READ_INTERVAL_US) {
             last_bme_read_us = now_us;
-            if (bme.update_pressure()) {
+            const bool bme_read_ok =
+#ifdef PICOPILOT_ENABLE_DIAGNOSTICS
+                bme.update_all();
+#else
+                bme.update_pressure();
+#endif
+#ifdef PICOPILOT_ENABLE_DIAGNOSTICS
+            last_bme_read_ok = bme_read_ok;
+#endif
+            if (bme_read_ok) {
+                DIAGNOSTIC_COUNT(bme_read_success_count);
+#ifdef PICOPILOT_ENABLE_DIAGNOSTICS
+                last_bme_success_us = now_us;
+#endif
                 current_sensors.baro_timestamp_us = now_us;
                 current_sensors.pressure = bme.get_pressure();
+            } else {
+                DIAGNOSTIC_COUNT(bme_read_failure_count);
             }
         }
 
+#ifdef PICOPILOT_ENABLE_DIAGNOSTICS
+        if (now_us - last_diagnostics_us >= DIAGNOSTICS_INTERVAL_US) {
+            last_diagnostics_us = now_us;
+            print_diagnostics(current_sensors, ekf, signal_ok, last_valid_imu_us,
+                              target_altitude_m, altitude_hold_captured, v_dot_filtered);
+        }
+#endif
+
         if (imu_data_ready) {
             imu_data_ready = false;
-            if (!imu.read_data()) continue;
+            const bool imu_read_ok = imu.read_data();
+#ifdef PICOPILOT_ENABLE_DIAGNOSTICS
+            last_imu_read_ok = imu_read_ok;
+#endif
+            if (!imu_read_ok) {
+                DIAGNOSTIC_COUNT(imu_read_failure_count);
+                continue;
+            }
+            DIAGNOSTIC_COUNT(imu_read_success_count);
             last_valid_imu_us = time_us_32();
 
             current_sensors.accel = {imu.ax, imu.ay, imu.az};
@@ -636,23 +927,37 @@ void core0_entry() {
             last_control_time_us = now_us;
             if (dt_ctrl <= 0.0f || dt_ctrl > 0.05f)
                 dt_ctrl = 0.0025f;
+#ifdef PICOPILOT_ENABLE_DIAGNOSTICS
+            diagnostic_dt_ctrl = dt_ctrl;
+#endif
 
-            uint16_t mode_channel = pulses[4];
+#ifdef PICOPILOT_ENABLE_DIAGNOSTICS
+            ::gps_navigation_valid = false;
+#endif
 
             if (!signal_ok ||
                 (pulses[4] >= 1500 && (!ekf.attitude_valid || !ekf.altitude_valid))) {
+#ifdef PICOPILOT_ENABLE_DIAGNOSTICS
+                control_mode = signal_ok ? "FAILSAFE_ESTIMATOR" : "FAILSAFE_PPM";
+#endif
                 set_pwm(THROTTLE_PIN, 1040);
                 set_pwm(ROLL_PIN, 1500);
                 set_pwm(PITCH_PIN, 1500);
                 set_pwm(YAW_PIN, 1500);
                 altitude_hold_captured = false;
             } else if (pulses[4] < 1500) {
+#ifdef PICOPILOT_ENABLE_DIAGNOSTICS
+                control_mode = "MANUAL";
+#endif
                 set_pwm(THROTTLE_PIN, pulses[2]);
                 set_pwm(ROLL_PIN, pulses[0]);
                 set_pwm(PITCH_PIN, pulses[1]);
                 set_pwm(YAW_PIN, pulses[3]);
                 altitude_hold_captured = false;
             } else {
+#ifdef PICOPILOT_ENABLE_DIAGNOSTICS
+                control_mode = "AUTO";
+#endif
                 Avionics::Quaternion q_curr = {ekf.q1, ekf.q2, ekf.q3, ekf.q4};
                 Avionics::Vector3 gyro_rad_s = {-imu.gx, -imu.gy, imu.gz};
                 float yaw_curr_rad = get_yaw_from_quaternion(ekf.q1, ekf.q2, ekf.q3, ekf.q4);
@@ -671,10 +976,53 @@ void core0_entry() {
                 tecs_in.h_curr = ekf.altitude;
                 tecs_in.h_dot_curr = ekf.vertical_speed;
                 tecs_in.v_set = map(pulses[5], 900.0f, 2200.0f, 0.0f, 27.0f);
-                tecs_in.v_curr = std::max(current_sensors.speed, 15.0f);
+                tecs_in.v_curr = current_sensors.speed;
                 tecs_in.v_dot_curr = v_dot_filtered;
+#ifdef PICOPILOT_ENABLE_DIAGNOSTICS
+                diagnostic_tecs_inputs = tecs_in;
+#endif
 
                 Avionics::TECSOutputs tecs_out = tecs_controller.update(tecs_in, dt_ctrl);
+#ifdef PICOPILOT_ENABLE_DIAGNOSTICS
+                diagnostic_tecs_outputs = tecs_out;
+#endif
+
+                const uint32_t gps_navigation_time_us = time_us_32();
+                const bool gps_navigation_valid =
+                    home_set &&
+                    current_sensors.gps_fix_valid &&
+                    current_sensors.course_valid &&
+                    current_sensors.gps_timestamp_us != 0 &&
+                    current_sensors.course_timestamp_us != 0 &&
+                    (uint32_t)(gps_navigation_time_us - current_sensors.gps_timestamp_us) <= GPS_NAVIGATION_TIMEOUT_US &&
+                    (uint32_t)(gps_navigation_time_us - current_sensors.course_timestamp_us) <= GPS_NAVIGATION_TIMEOUT_US &&
+                    std::isfinite(current_sensors.speed) &&
+                    std::isfinite(current_sensors.course) &&
+                    current_sensors.speed >= 1.0f;
+#ifdef PICOPILOT_ENABLE_DIAGNOSTICS
+                ::gps_navigation_valid = gps_navigation_valid;
+#endif
+                float target_course_rad;
+                if (gps_navigation_valid &&
+                    calculate_orbit_course(
+                        current_sensors.lat, current_sensors.lon,
+                        home_lat, home_lon,
+                        HOME_ORBIT_RADIUS_M, HOME_ORBIT_CLOCKWISE,
+                        target_course_rad)) {
+                    flight_controller.updateGPSCourse(
+                        target_course_rad,
+                        current_sensors.course * (M_PI / 180.0f),
+                        current_sensors.speed);
+#ifdef PICOPILOT_ENABLE_DIAGNOSTICS
+                    diagnostic_target_course_rad = target_course_rad;
+#endif
+                } else {
+                    flight_controller.clearGPSCourse();
+#ifdef PICOPILOT_ENABLE_DIAGNOSTICS
+                    diagnostic_target_course_rad = 0.0f;
+#endif
+                }
+
                 Avionics::ServoOutputs servos = flight_controller.updateAttitude(
                     dt_ctrl,
                     q_curr,
@@ -683,6 +1031,9 @@ void core0_entry() {
                     yaw_curr_rad,
                     tecs_out
                 );
+#ifdef PICOPILOT_ENABLE_DIAGNOSTICS
+                diagnostic_servo_outputs = servos;
+#endif
 
                 if(pulses[5] < 1200){
                     set_pwm(THROTTLE_PIN, pulses[2]);
@@ -699,10 +1050,14 @@ void core0_entry() {
             last_telemetry_tx_us = now_us;
             send_telemetry_dma(current_sensors, ekf);
         }
+
     }
 }
 
 int main() {
+#ifdef PICOPILOT_ENABLE_DIAGNOSTICS
+    stdio_init_all();
+#endif
     watchdog_enable(1000, true);
     compensator_config.lever_arm_m = lever_arm_m;
 

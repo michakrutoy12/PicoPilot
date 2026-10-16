@@ -97,9 +97,9 @@ void Neo6M::parse_line(std::string_view line) {
         process_gga(line);
     } else if (line.find("RMC") != std::string_view::npos) {
         process_rmc(line);
-    } else if (line.find("VTG") != std::string_view::npos) {
-        process_vtg(line);
-    }
+    } // else if (line.find("VTG") != std::string_view::npos) {
+    //     process_vtg(line);
+    // }
 }
 
 std::string_view Neo6M::get_field(std::string_view line, int field_index) {
