@@ -72,12 +72,13 @@ target_link_libraries(PicoPilot
         pico_multicore
         hardware_dma
 
-        pico_acs712
-        pico_bme280
-        pico_mpu6500
-        pico_neo6m
-        pico_sensor_fusion
-        pico_control
+        picopilot_acs712
+        picopilot_bme280
+        picopilot_mpu6500
+        picopilot_neo6m
+        picopilot_sensor_fusion
+        picopilot_control
+        picopilot_routing
     )
 
 pico_add_extra_outputs(PicoPilot)

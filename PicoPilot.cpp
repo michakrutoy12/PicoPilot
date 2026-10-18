@@ -1,8 +1,10 @@
 #include "pico/stdlib.h"
-#include "pico/stdio_usb.h"
 #include <cmath>
 #include <cstring>
+#ifdef PICOPILOT_ENABLE_DIAGNOSTICS
+#include "pico/stdio_usb.h"
 #include <cstdio>
+#endif
 
 #include "pico/multicore.h"
 #include "hardware/sync.h"
@@ -355,8 +357,7 @@ void ppm_handler() {
     }
 }
 
-void gps_handler()
-{
+void gps_handler() {
     uart_get_hw(UART)->icr = 0x7FF;
 
     while (uart_is_readable(UART)) {
@@ -724,10 +725,6 @@ int main() {
 }
 
 extern "C" void isr_hardfault() {
-    pwm_set_gpio_level(THROTTLE_PIN, 1040);
-    pwm_set_gpio_level(ROLL_PIN, 1500);
-    pwm_set_gpio_level(PITCH_PIN, 1500);
-    pwm_set_gpio_level(YAW_PIN, 1500);
     sio_hw->gpio_oe_set = (1u << 25);
     while (true) {
         sio_hw->gpio_togl = (1u << 25);

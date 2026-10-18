@@ -1,5 +1,5 @@
-add_library(pico_control control.hpp control.cpp)
+add_library(picopilot_control control.hpp control.cpp)
 
-target_link_libraries(pico_control pico_stdlib)
+target_link_libraries(picopilot_control pico_stdlib)
 
-target_include_directories(pico_control PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+target_include_directories(picopilot_control PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
