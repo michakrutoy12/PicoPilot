@@ -557,6 +557,8 @@ void core0_entry() {
     const uint32_t TELEMETRY_INTERVAL_US = 200000;
 
     uint32_t last_control_time_us = time_us_32();
+    constexpr uint32_t CONTROL_INTERVAL_US = 2500;
+    constexpr uint32_t MAX_IMU_AGE_US = 50000;
     constexpr uint32_t CORE1_STALE_TIMEOUT_US = 100000;
 
 #ifdef PICOPILOT_ENABLE_DIAGNOSTICS
@@ -573,12 +575,7 @@ void core0_entry() {
         bool signal_ok = ppm_frame_valid &&
                          (now_us - last_valid_ppm_us) < MAX_NO_SIGNAL_TIME;
         bool core1_healthy = (now_us - core1_heartbeat_us) < CORE1_STALE_TIMEOUT_US;
-        if (!core1_healthy) {
-            set_pwm(THROTTLE_PIN, 1040);
-            set_pwm(ROLL_PIN, 1500);
-            set_pwm(PITCH_PIN, 1500);
-            set_pwm(YAW_PIN, 1500);
-        } else {
+        if (core1_healthy) {
             watchdog_update();
         }
 
@@ -618,28 +615,28 @@ void core0_entry() {
 
         if (imu_data_ready) {
             imu_data_ready = false;
-            if (!imu.read_data()) {
-                continue;
+            if (imu.read_data()) {
+                current_sensors.accel = {imu.ax, imu.ay, imu.az};
+                current_sensors.gyro = {imu.gx, imu.gy, imu.gz};
+                current_sensors.imu_timestamp_us = imu_irq_timestamp_us;
+
+                send_sensors_to_core1(current_sensors);
+                if (multicore_fifo_wready())
+                    multicore_fifo_push_blocking(1);
             }
+        }
 
-            current_sensors.accel = {imu.ax, imu.ay, imu.az};
-            current_sensors.gyro = {imu.gx, imu.gy, imu.gz};
-            current_sensors.imu_timestamp_us = imu_irq_timestamp_us;
-
-            send_sensors_to_core1(current_sensors);
-            if (multicore_fifo_wready())
-                multicore_fifo_push_blocking(1);
-
-            ekf = get_ekf_on_core0();
-
+        if (now_us - last_control_time_us >= CONTROL_INTERVAL_US) {
             float dt_ctrl = static_cast<float>(now_us - last_control_time_us) / 1000000.0f;
             last_control_time_us = now_us;
             if (dt_ctrl <= 0.0f || dt_ctrl > 0.05f)
                 dt_ctrl = 0.0025f;
 
-            uint16_t mode_channel = pulses[4];
+            ekf = get_ekf_on_core0();
+            bool imu_ok = current_sensors.imu_timestamp_us != 0 &&
+                          (now_us - current_sensors.imu_timestamp_us) < MAX_IMU_AGE_US;
 
-            if (!signal_ok || !core1_healthy) {
+            if (!signal_ok) {
                 set_pwm(THROTTLE_PIN, 1040);
                 set_pwm(ROLL_PIN, 1500);
                 set_pwm(PITCH_PIN, 1500);
@@ -650,6 +647,12 @@ void core0_entry() {
                 set_pwm(ROLL_PIN, pulses[0]);
                 set_pwm(PITCH_PIN, pulses[1]);
                 set_pwm(YAW_PIN, pulses[3]);
+                altitude_hold_captured = false;
+            } else if (!core1_healthy || !imu_ok) {
+                set_pwm(THROTTLE_PIN, 1040);
+                set_pwm(ROLL_PIN, 1500);
+                set_pwm(PITCH_PIN, 1500);
+                set_pwm(YAW_PIN, 1500);
                 altitude_hold_captured = false;
             } else {
                 Avionics::Quaternion q_curr = {ekf.q1, ekf.q2, ekf.q3, ekf.q4};
