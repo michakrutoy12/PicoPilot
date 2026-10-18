@@ -1,6 +1,8 @@
 #include "pico/stdlib.h"
+#include "pico/stdio_usb.h"
 #include <cmath>
 #include <cstring>
+#include <cstdio>
 
 #include "pico/multicore.h"
 #include "hardware/sync.h"
@@ -14,6 +16,7 @@
 #include "hardware/adc.h"
 #include "hardware/irq.h"
 #include "hardware/pwm.h"
+#include "hardware/watchdog.h"
 
 #include "mpu6500.hpp"
 #include "bme280.hpp"
@@ -127,16 +130,16 @@ spin_lock_t *ekf_lock;
 
 volatile bool imu_data_ready = false;
 uint32_t imu_irq_timestamp_us = 0;
+volatile uint32_t core1_heartbeat_us = 0;
 
 /* PPM */
 volatile bool sync_stop = true;
 volatile uint8_t pulses_nr = 0;
 volatile uint16_t pulses[N_CHANNELS] = {1500, 1500, 1040, 1500, 1500, 1500}; // roll, pitch, throttle, yaw, CH5, CH6
+volatile uint16_t ppm_capture[N_CHANNELS] = {};
+volatile bool ppm_frame_valid = false;
 volatile uint32_t last_valid_ppm_us = 0;
 volatile uint32_t interruptTime, previousTime = 0;
-
-uint16_t signal_power = 1500;
-uint32_t signal_timer = 0;
 /* === */
 
 static TelemetryPacket tx_packet_buffer;
@@ -267,11 +270,13 @@ EKFOutput get_ekf_on_core0() {
 }
 
 static inline uint16_t servo_to_pwm(float val) {
+    if (!std::isfinite(val)) return 1500;
     val = std::clamp(val, -1.0f, 1.0f);
     return static_cast<uint16_t>(1500.0f + val * 500.0f);
 }
 
 static inline uint16_t throttle_to_pwm(float val) {
+    if (!std::isfinite(val)) return 1040;
     val = std::clamp(val, 0.0f, 1.0f);
     return static_cast<uint16_t>(1040.0f + val * 960.0f);
 }
@@ -282,20 +287,69 @@ float get_yaw_from_quaternion(float q1, float q2, float q3, float q4) {
     return std::atan2(siny_cosp, cosy_cosp);
 }
 
+#ifdef PICOPILOT_ENABLE_DIAGNOSTICS
+void print_sensor_diagnostics(const RawSensorData& sensors, const EKFOutput& ekf,
+                              uint32_t now_us, bool signal_ok) {
+    if (!stdio_usb_connected()) return;
+
+    uint32_t imu_age_ms = (now_us - sensors.imu_timestamp_us) / 1000;
+    uint32_t baro_age_ms = (now_us - sensors.baro_timestamp_us) / 1000;
+    uint32_t gps_age_ms = (now_us - sensors.gps_timestamp_us) / 1000;
+
+    printf("\n--- Sensor status ---\n");
+    printf("IMU age=%lu ms accel[m/s^2]=%.2f %.2f %.2f gyro[rad/s]=%.3f %.3f %.3f temp=%.1f C\n",
+           static_cast<unsigned long>(imu_age_ms),
+           imu.ax, imu.ay, imu.az, imu.gx, imu.gy, imu.gz, imu.temp);
+    printf("BME280 age=%lu ms pressure=%.1f Pa temp=%.2f C baro_alt=%.1f m\n",
+           static_cast<unsigned long>(baro_age_ms),
+           sensors.pressure, bme.get_temperature(),
+           Variometer::pressure_to_altitude(sensors.pressure));
+    printf("GPS age=%lu ms fix=%d sats=%u hdop=%.2f lat=%.6f lon=%.6f alt=%.1f m speed=%.2f m/s course=%.1f deg\n",
+           static_cast<unsigned long>(gps_age_ms), gps.fix_state,
+           static_cast<unsigned>(sensors.satellites), sensors.hdop,
+           sensors.lat, sensors.lon, sensors.gps_altitude, sensors.speed,
+           sensors.course * (180.0f / 3.14159265358979323846f));
+    printf("EKF q=%.4f %.4f %.4f %.4f altitude=%.1f m vertical_speed=%.2f m/s\n",
+           ekf.q1, ekf.q2, ekf.q3, ekf.q4, ekf.altitude, ekf.vertical_speed);
+    printf("PPM valid=%s channels[roll,pitch,throttle,yaw,mode,speed]=%u %u %u %u %u %u us\n",
+           signal_ok ? "yes" : "no",
+           static_cast<unsigned>(pulses[0]), static_cast<unsigned>(pulses[1]),
+           static_cast<unsigned>(pulses[2]), static_cast<unsigned>(pulses[3]),
+           static_cast<unsigned>(pulses[4]), static_cast<unsigned>(pulses[5]));
+}
+#endif
+
 void ppm_handler() {
     previousTime = interruptTime;
-    interruptTime = time_us_64();
-    uint16_t pulseLength = (uint16_t)(interruptTime - previousTime);
+    interruptTime = time_us_32();
+    uint32_t pulseLength = interruptTime - previousTime;
 
     if (pulseLength > PAUSE_PULSE_MIN_LENGTH && pulseLength < PAUSE_PULSE_MAX_LENGTH) {
         if (pulses_nr == N_CHANNELS) {
-            last_valid_ppm_us = interruptTime;
+            bool valid_frame = true;
+            for (uint8_t i = 0; i < N_CHANNELS; ++i) {
+                if (ppm_capture[i] < 900 || ppm_capture[i] > 2200) {
+                    valid_frame = false;
+                    break;
+                }
+            }
+            if (valid_frame) {
+                for (uint8_t i = 0; i < N_CHANNELS; ++i) {
+                    pulses[i] = ppm_capture[i];
+                }
+                ppm_frame_valid = true;
+                last_valid_ppm_us = interruptTime;
+            }
         }
         pulses_nr = 0;
     }
     else {
         if (pulses_nr < N_CHANNELS) {
-            pulses[pulses_nr] = pulseLength;
+            if (pulseLength >= 900 && pulseLength <= 2200) {
+                ppm_capture[pulses_nr] = static_cast<uint16_t>(pulseLength);
+            } else {
+                ppm_capture[pulses_nr] = 0;
+            }
             pulses_nr++;
         }
     }
@@ -410,6 +464,7 @@ void core1_entry() {
     EKFOutput ekf_result;
     Vector3f gyro_clean, accel_corr;
     float adapted_r;
+    core1_heartbeat_us = time_us_32();
 
     uint32_t last_imu_timestamp_us = 0;
     uint32_t last_baro_timestamp_us = 0;
@@ -483,6 +538,7 @@ void core1_entry() {
 
         loop_counter++;
         send_ekf_to_core0(ekf_result);
+        core1_heartbeat_us = time_us_32();
     }
 }
 
@@ -500,6 +556,12 @@ void core0_entry() {
     const uint32_t TELEMETRY_INTERVAL_US = 200000;
 
     uint32_t last_control_time_us = time_us_32();
+    constexpr uint32_t CORE1_STALE_TIMEOUT_US = 100000;
+
+#ifdef PICOPILOT_ENABLE_DIAGNOSTICS
+    constexpr uint32_t DIAGNOSTICS_INTERVAL_US = 1000000;
+    uint32_t last_diagnostics_us = last_control_time_us;
+#endif
 
     float target_altitude_m = 0.0f;
     bool altitude_hold_captured = false;
@@ -507,7 +569,17 @@ void core0_entry() {
 
     while (true) {
         uint32_t now_us = time_us_32();
-        bool signal_ok = (now_us - last_valid_ppm_us) < MAX_NO_SIGNAL_TIME && signal_power > SIGNAL_POWER_THRESHOLD;
+        bool signal_ok = ppm_frame_valid &&
+                         (now_us - last_valid_ppm_us) < MAX_NO_SIGNAL_TIME;
+        bool core1_healthy = (now_us - core1_heartbeat_us) < CORE1_STALE_TIMEOUT_US;
+        if (!core1_healthy) {
+            set_pwm(THROTTLE_PIN, 1040);
+            set_pwm(ROLL_PIN, 1500);
+            set_pwm(PITCH_PIN, 1500);
+            set_pwm(YAW_PIN, 1500);
+        } else {
+            watchdog_update();
+        }
 
         char c;
         while (gps_ring_buffer.pop(c)) {
@@ -537,14 +609,17 @@ void core0_entry() {
 
         if (now_us - last_bme_read_us >= BME_READ_INTERVAL_US) {
             last_bme_read_us = now_us;
-            bme.update_pressure();
-            current_sensors.baro_timestamp_us = now_us;
-            current_sensors.pressure = bme.get_pressure();
+            if (bme.update_pressure()) {
+                current_sensors.baro_timestamp_us = now_us;
+                current_sensors.pressure = bme.get_pressure();
+            }
         }
 
         if (imu_data_ready) {
             imu_data_ready = false;
-            imu.read_data();
+            if (!imu.read_data()) {
+                continue;
+            }
 
             current_sensors.accel = {imu.ax, imu.ay, imu.az};
             current_sensors.gyro = {imu.gx, imu.gy, imu.gz};
@@ -563,7 +638,7 @@ void core0_entry() {
 
             uint16_t mode_channel = pulses[4];
 
-            if (!signal_ok) {
+            if (!signal_ok || !core1_healthy) {
                 set_pwm(THROTTLE_PIN, 1040);
                 set_pwm(ROLL_PIN, 1500);
                 set_pwm(PITCH_PIN, 1500);
@@ -586,7 +661,7 @@ void core0_entry() {
                 }
 
                 float sin_pitch = 2.0f * (ekf.q1 * ekf.q3 - ekf.q2 * ekf.q4);
-                float v_dot_imu = (imu.ax * 9.80665f) - 9.80665f * sin_pitch;
+                float v_dot_imu = imu.ax - 9.80665f * sin_pitch;
                 v_dot_filtered += 0.1f * (v_dot_imu - v_dot_filtered);
 
                 Avionics::TECSInputs tecs_in;
@@ -622,14 +697,26 @@ void core0_entry() {
             last_telemetry_tx_us = now_us;
             send_telemetry_dma(current_sensors, ekf);
         }
+
+#ifdef PICOPILOT_ENABLE_DIAGNOSTICS
+        if (now_us - last_diagnostics_us >= DIAGNOSTICS_INTERVAL_US) {
+            last_diagnostics_us = now_us;
+            print_sensor_diagnostics(current_sensors, ekf, now_us, signal_ok);
+        }
+#endif
     }
 }
 
 int main() {
+    watchdog_enable(1000, true);
     compensator_config.lever_arm_m = lever_arm_m;
 
+#ifdef PICOPILOT_ENABLE_DIAGNOSTICS
+    stdio_init_all();
+#endif
     hardware_init();
 
+    core1_heartbeat_us = time_us_32();
     multicore_launch_core1(&core1_entry);
     core0_entry();
 
@@ -637,6 +724,10 @@ int main() {
 }
 
 extern "C" void isr_hardfault() {
+    pwm_set_gpio_level(THROTTLE_PIN, 1040);
+    pwm_set_gpio_level(ROLL_PIN, 1500);
+    pwm_set_gpio_level(PITCH_PIN, 1500);
+    pwm_set_gpio_level(YAW_PIN, 1500);
     sio_hw->gpio_oe_set = (1u << 25);
     while (true) {
         sio_hw->gpio_togl = (1u << 25);

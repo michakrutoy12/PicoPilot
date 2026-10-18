@@ -1,4 +1,5 @@
 #include "bme280.hpp"
+#include <cmath>
 
 namespace Reg {
     constexpr uint8_t ID        = 0xD0;
@@ -19,7 +20,7 @@ BME280::BME280(i2c_inst_t* i2c_instance, uint8_t addr)
 
 bool BME280::write_register(uint8_t reg, uint8_t value) {
     uint8_t buf[2] = { reg, value };
-    return i2c_write_blocking(i2c_, address_, buf, 2, false) == 2;
+    return i2c_write_timeout_per_char_us(i2c_, address_, buf, 2, false, 1000) == 2;
 }
 
 bool BME280::read_registers(uint8_t reg, uint8_t* buffer, size_t len) {
@@ -39,18 +40,18 @@ bool BME280::init() {
         return false;
     }
 
-    write_register(Reg::RESET, 0xB6);
+    if (!write_register(Reg::RESET, 0xB6)) return false;
     sleep_ms(10);
 
     if (!read_calibration_data()) {
         return false;
     }
 
-    write_register(Reg::CTRL_HUM, 0x01);
+    if (!write_register(Reg::CTRL_HUM, 0x01)) return false;
 
-    write_register(Reg::CONFIG, (0x00 << 5) | (0x02 << 2));
+    if (!write_register(Reg::CONFIG, (0x00 << 5) | (0x02 << 2))) return false;
 
-    write_register(Reg::CTRL_MEAS, (0x01 << 5) | (0x01 << 2) | 0x03);
+    if (!write_register(Reg::CTRL_MEAS, (0x01 << 5) | (0x01 << 2) | 0x03)) return false;
 
     sleep_ms(10);
     return true;
@@ -134,8 +135,13 @@ bool BME280::update_all() {
     int32_t adc_T = (buf[3] << 12) | (buf[4] << 4) | (buf[5] >> 4);
     int32_t adc_H = (buf[6] << 8)  | buf[7];
 
-    temperature_c_ = compensate_temp(adc_T);
-    pressure_pa_   = compensate_press(adc_P);
+    float temperature = compensate_temp(adc_T);
+    float pressure = compensate_press(adc_P);
+    if (!std::isfinite(temperature) || !std::isfinite(pressure) || pressure < 100.0f) {
+        return false;
+    }
+    temperature_c_ = temperature;
+    pressure_pa_ = pressure;
     humidity_pct_  = compensate_hum(adc_H);
 
     return true;
@@ -158,8 +164,13 @@ bool BME280::update_pressure() {
     int32_t adc_P = (buf[0] << 12) | (buf[1] << 4) | (buf[2] >> 4);
     int32_t adc_T = (buf[3] << 12) | (buf[4] << 4) | (buf[5] >> 4);
 
-    temperature_c_ = compensate_temp(adc_T);
-    pressure_pa_   = compensate_press(adc_P);
+    float temperature = compensate_temp(adc_T);
+    float pressure = compensate_press(adc_P);
+    if (!std::isfinite(temperature) || !std::isfinite(pressure) || pressure < 100.0f) {
+        return false;
+    }
+    temperature_c_ = temperature;
+    pressure_pa_ = pressure;
 
     return true;
 }

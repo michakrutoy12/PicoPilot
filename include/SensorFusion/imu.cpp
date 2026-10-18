@@ -45,9 +45,11 @@ void ExtendedKalmanFilter::set_r_accel(float r_accel){
 
 void ExtendedKalmanFilter::normalizeQuaternion() {
     float normSq = x[0]*x[0] + x[1]*x[1] + x[2]*x[2] + x[3]*x[3];
-    if (normSq > 0.0f) {
+    if (std::isfinite(normSq) && normSq > 1e-12f) {
         float invNorm = fastInvSqrt(normSq);
         x[0] *= invNorm; x[1] *= invNorm; x[2] *= invNorm; x[3] *= invNorm;
+    } else {
+        x[0] = 1.0f; x[1] = 0.0f; x[2] = 0.0f; x[3] = 0.0f;
     }
 }
 
@@ -208,7 +210,9 @@ void ExtendedKalmanFilter::getEulerAngles(float& roll, float& pitch, float& yaw)
 }
 
 void ExtendedKalmanFilter::correctYawDrift(float gpsCourseRad, float gpsSpeed, float dt, float K_drift) {
-    if (gpsSpeed < 1.0f || std::isnan(gpsCourseRad)) return; 
+    if (!std::isfinite(gpsCourseRad) || !std::isfinite(gpsSpeed) ||
+        !std::isfinite(dt) || !std::isfinite(K_drift) ||
+        gpsSpeed < 1.0f || dt <= 0.0f) return;
 
     float q0 = x[0], q1 = x[1], q2 = x[2], q3 = x[3];
 

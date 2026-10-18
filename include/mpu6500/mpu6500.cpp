@@ -3,44 +3,45 @@
 MPU6500::MPU6500(i2c_inst_t* i2c, uint8_t address) 
     : _i2c(i2c), _address(address) {}
 
-void MPU6500::writeReg(uint8_t reg, uint8_t value) {
+bool MPU6500::writeReg(uint8_t reg, uint8_t value) {
     uint8_t buf[] = {reg, value};
-    i2c_write_blocking(_i2c, _address, buf, 2, false);
+    return i2c_write_timeout_per_char_us(_i2c, _address, buf, 2, false, 1000) == 2;
 }
 
-uint8_t MPU6500::readReg(uint8_t reg) {
-    uint8_t val;
-    i2c_write_blocking(_i2c, _address, &reg, 1, true);
-    i2c_read_blocking(_i2c, _address, &val, 1, false);
-    return val;
+bool MPU6500::readReg(uint8_t reg, uint8_t& value) {
+    if (i2c_write_timeout_per_char_us(_i2c, _address, &reg, 1, true, 1000) != 1) {
+        return false;
+    }
+    return i2c_read_timeout_per_char_us(_i2c, _address, &value, 1, false, 1000) == 1;
 }
 
 bool MPU6500::begin() {
-    uint8_t id = readReg(REG_WHO_AM_I);
+    uint8_t id = 0;
+    if (!readReg(REG_WHO_AM_I, id)) return false;
     if (id != 0x70) {
         return false;
     }
 
-    writeReg(REG_PWR_MGMT_1, 0x01);
+    if (!writeReg(REG_PWR_MGMT_1, 0x01)) return false;
     sleep_ms(10);
 
-    writeReg(REG_CONFIG, 0x03);
-    writeReg(REG_SMPLRT_DIV, 0x09);
+    if (!writeReg(REG_CONFIG, 0x03)) return false;
+    if (!writeReg(REG_SMPLRT_DIV, 0x09)) return false;
 
-    writeReg(REG_GYRO_CONFIG, 0x08);
-    writeReg(REG_ACCEL_CONFIG, 0x10);
+    if (!writeReg(REG_GYRO_CONFIG, 0x08)) return false;
+    if (!writeReg(REG_ACCEL_CONFIG, 0x10)) return false;
 
-    writeReg(REG_INT_ENABLE, 0x01);
+    if (!writeReg(REG_INT_ENABLE, 0x01)) return false;
 
     return true;
 }
 
-void MPU6500::read_data() {
+bool MPU6500::read_data() {
     uint8_t reg = REG_ACCEL_XOUT_H;
-    uint8_t buffer[14];
+    uint8_t buffer[14] = {};
 
-    if (i2c_write_timeout_us(_i2c, _address, &reg, 1, true, 1000) == PICO_ERROR_TIMEOUT) return;
-    if (i2c_read_timeout_us(_i2c, _address, buffer, 14, false, 1000) == PICO_ERROR_TIMEOUT) return;
+    if (i2c_write_timeout_us(_i2c, _address, &reg, 1, true, 1000) != 1) return false;
+    if (i2c_read_timeout_us(_i2c, _address, buffer, 14, false, 1000) != 14) return false;
 
     int16_t raw_ax = (buffer[0] << 8) | buffer[1];
     int16_t raw_ay = (buffer[2] << 8) | buffer[3];
@@ -61,6 +62,7 @@ void MPU6500::read_data() {
     gx = static_cast<float>(raw_gy) * GYRO_SCALE;
     gy = static_cast<float>(raw_gx) * GYRO_SCALE;
     gz = static_cast<float>(raw_gz) * GYRO_SCALE;
+    return true;
 }
 
 float MPU6500::setSampleRate(uint16_t hz) {
