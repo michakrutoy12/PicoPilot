@@ -1,4 +1,5 @@
 #include "pico/stdlib.h"
+#include "pico/flash.h"
 #include <cmath>
 #include <cstring>
 #ifdef PICOPILOT_ENABLE_DIAGNOSTICS
@@ -30,6 +31,8 @@
 #include "altitude.hpp"
 #include "correction.hpp"
 #include "control.hpp"
+#include "routing.hpp"
+#include "storage.hpp"
 
 /* CONTROL MOTORS */
 #define THROTTLE_PIN 14
@@ -148,34 +151,6 @@ static TelemetryPacket tx_packet_buffer;
 
 float map(float x, float in_min, float in_max, float out_min, float out_max) {
     return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
-}
-
-float calculate_distance(double lat1, double lon1, double lat2, double lon2) {
-    constexpr double EARTH_RADIUS_M = 6371000.88;
-    constexpr double DEG_TO_RAD = M_PI / 180.0;
-
-    double dlat = (lat2 - lat1) * DEG_TO_RAD;
-    double dlon = (lon2 - lon1) * DEG_TO_RAD;
-
-    double mean_lat = ((lat1 + lat2) / 2.0) * DEG_TO_RAD;
-
-    double x = dlon * std::cos(mean_lat);
-    double y = dlat;
-
-    return static_cast<float>(EARTH_RADIUS_M * std::sqrt(x * x + y * y));
-}
-
-float calculate_bearing(double lat1, double lon1, double lat2, double lon2) {
-    constexpr double DEG_TO_RAD = M_PI / 180.0;
-
-    double phi1 = lat1 * DEG_TO_RAD;
-    double phi2 = lat2 * DEG_TO_RAD;
-    double dlambda = (lon2 - lon1) * DEG_TO_RAD;
-
-    double y = std::sin(dlambda) * std::cos(phi2);
-    double x = std::cos(phi1) * std::sin(phi2) - std::sin(phi1) * std::cos(phi2) * std::cos(dlambda);
-
-    return static_cast<float>(std::atan2(y, x));
 }
 
 uint8_t calculate_checksum(const uint8_t *data, size_t len) {
@@ -457,6 +432,10 @@ void hardware_init() {
 }
 
 void core1_entry() {
+    if (!flash_safe_execute_core_init()) {
+        panic("Failed to initialize flash-safe execution on core 1");
+    }
+
     static ExtendedKalmanFilter ekf;
     static Variometer variometer;
     static CentripetalCompensator compensator(compensator_config);

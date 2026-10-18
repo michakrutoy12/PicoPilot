@@ -57,7 +57,6 @@ target_link_libraries(PicoPilot
 target_include_directories(PicoPilot PRIVATE
         ${CMAKE_CURRENT_LIST_DIR}
 )
-
 add_subdirectory(include)
 
 target_link_libraries(PicoPilot
