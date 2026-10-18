@@ -82,24 +82,34 @@ std::string_view Neo6M::get_field(std::string_view line, int field_index) {
 
 void Neo6M::process_gga(std::string_view line) {
     std::string_view s_lat = get_field(line, 2);
+    std::string_view s_ns = get_field(line, 3);
     std::string_view s_lon = get_field(line, 4);
+    std::string_view s_ew = get_field(line, 5);
     std::string_view s_fix = get_field(line, 6);
     std::string_view s_sat = get_field(line, 7);
     std::string_view s_hdop = get_field(line, 8);
     std::string_view s_alt = get_field(line, 9);
 
-    if (!s_lat.empty()) {
+    if (!s_lat.empty() && !s_ns.empty()) {
         double raw_lat = to_double(s_lat);
         int lat_deg = (int)(raw_lat / 100);
         double lat_min = raw_lat - (lat_deg * 100);
         latitude = lat_deg + (lat_min / 60.0);
+
+        if (s_ns == "S") {
+            latitude = -latitude;
+        }
     }
     
-    if (!s_lon.empty()){
+    if (!s_lon.empty() && !s_ew.empty()){
         double raw_lon = to_double(s_lon);
         int lon_deg = (int)(raw_lon / 100);
         double lon_min = raw_lon - (lon_deg * 100);
         longitude = lon_deg + (lon_min / 60.0);
+
+        if (s_ew == "W") {
+            longitude = -longitude;
+        }
     }
     
     if (!s_fix.empty())  fix_state = to_long(s_fix);
