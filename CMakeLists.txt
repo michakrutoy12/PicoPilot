@@ -47,7 +47,7 @@ pico_set_program_version(PicoPilot "0.1")
 
 # Modify the below lines to enable/disable output over UART/USB
 pico_enable_stdio_uart(PicoPilot 0)
-pico_enable_stdio_usb(PicoPilot ${PICOPILOT_ENABLE_DIAGNOSTICS})
+pico_enable_stdio_usb(PicoPilot 1)
 
 # Add the standard library to the build
 target_link_libraries(PicoPilot

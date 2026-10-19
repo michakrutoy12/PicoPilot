@@ -6,3 +6,5 @@
 !include/
 !include/**
 !CMAkeLists.txt
+
+.DS_Store

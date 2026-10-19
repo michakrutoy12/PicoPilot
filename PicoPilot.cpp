@@ -67,7 +67,7 @@
 
 const uint8_t BUTTON_PIN = 14;
 bool route_load_mode = false;
-const uint8_t MAX_LINE_LENGTH = 128;
+const uint8_t MAX_LINE_LENGTH = 64;
 
 RouteStorage::RouteLoader route_loader;
 
@@ -300,6 +300,52 @@ void print_sensor_diagnostics(const RawSensorData& sensors, const EKFOutput& ekf
            static_cast<unsigned>(pulses[2]), static_cast<unsigned>(pulses[3]),
            static_cast<unsigned>(pulses[4]), static_cast<unsigned>(pulses[5]));
 }
+
+void print_route(const RouteStorage::Route* route) {
+    printf("\n--- Route: %u waypoints ---\n", route->count);
+
+    for (uint16_t i = 0; i < route->count; ++i) {
+        const RouteStorage::Waypoint* p = &route->points[i];
+
+        printf(
+            "\nWaypoint %u:\n"
+            "  Latitude:  %.7f\n"
+            "  Longitude: %.7f\n"
+            "  Altitude:  %.2f m\n"
+            "  Speed:     %.2f\n",
+            (unsigned)(i + 1),
+            p->latitude,
+            p->longitude,
+            (double)p->altitude,
+            (double)p->speed
+        );
+
+        if (i + 1 < route->count) {
+            const RouteStorage::Waypoint* next = &route->points[i + 1];
+
+            float distance = calculate_distance(
+                p->latitude, p->longitude,
+                next->latitude, next->longitude
+            );
+
+            float bearing = calculate_bearing(
+                p->latitude, p->longitude,
+                next->latitude, next->longitude
+            );
+
+            printf(
+                "  Distance to next: %.2f m\n"
+                "  Required course:   %.2f degrees\n",
+                (double)distance,
+                (double)bearing
+            );
+        } else {
+            printf("  End of route.\n");
+        }
+    }
+
+    printf("\n--- End of route ---\n");
+}
 #endif
 
 void ppm_handler() {
@@ -436,10 +482,6 @@ void hardware_init() {
     sensor_lock = spin_lock_init(spin_lock_claim_unused(true));
     ekf_lock = spin_lock_init(spin_lock_claim_unused(true));
 
-    gpio_init(BUTTON_PIN);
-    gpio_set_dir(BUTTON_PIN, GPIO_IN);
-    gpio_pull_up(BUTTON_PIN);
-
 }
 
 void core1_entry() {
@@ -544,6 +586,9 @@ void core0_entry() {
     Avionics::Router router;
 
     route_loader.load(route);
+#ifdef PICOPILOT_ENABLE_DIAGNOSTICS
+    print_route(&route);
+#endif
     // router.set_route(route);
 
     uint32_t last_bme_read_us = 0;
@@ -625,26 +670,28 @@ void core0_entry() {
         if (now_us - last_control_time_us >= CONTROL_INTERVAL_US) {
             float dt_ctrl = static_cast<float>(now_us - last_control_time_us) / 1000000.0f;
             last_control_time_us = now_us;
-            if (dt_ctrl <= 0.0f || dt_ctrl > 0.05f)
-                dt_ctrl = 0.0025f;
+            if (dt_ctrl <= 0.0f || dt_ctrl > 0.05f) dt_ctrl = 0.0025f;
 
             ekf = get_ekf_on_core0();
             bool imu_ok = current_sensors.imu_timestamp_us != 0 &&
                           (now_us - current_sensors.imu_timestamp_us) < MAX_IMU_AGE_US;
 
             if (!signal_ok) {
+                // FailSafe, home return
                 set_pwm(THROTTLE_PIN, 1040);
                 set_pwm(ROLL_PIN, 1500);
                 set_pwm(PITCH_PIN, 1500);
                 set_pwm(YAW_PIN, 1500);
                 altitude_hold_captured = false;
             } else if (pulses[4] < 1500) {
+                // Direct control
                 set_pwm(THROTTLE_PIN, pulses[2]);
                 set_pwm(ROLL_PIN, pulses[0]);
                 set_pwm(PITCH_PIN, pulses[1]);
                 set_pwm(YAW_PIN, pulses[3]);
                 altitude_hold_captured = false;
             } else if (!core1_healthy || !imu_ok) {
+                // Critical Failure
                 set_pwm(THROTTLE_PIN, 1040);
                 set_pwm(ROLL_PIN, 1500);
                 set_pwm(PITCH_PIN, 1500);
@@ -707,9 +754,7 @@ void core0_entry() {
     }
 }
 
-RouteStorage::Waypoint parse_csv_line(char* line) {
-    RouteStorage::Waypoint waypoint = {0};
-
+void parse_csv_line(char* line, RouteStorage::Waypoint& waypoint) {
     char* token = strtok(line, ",");
     if (token != NULL) waypoint.latitude = strtod(token, NULL);
 
@@ -721,8 +766,6 @@ RouteStorage::Waypoint parse_csv_line(char* line) {
 
     token = strtok(NULL, ",");
     if (token != NULL) waypoint.speed = strtof(token, NULL);
-
-    return waypoint;
 }
 
 
@@ -757,11 +800,8 @@ void load_route(){
                         break;
                     }
                 } 
-                else if(receiving){
-                    if(route.count < RouteStorage::MAX_WAYPOINTS){
-                        RouteStorage::Waypoint waypoint = parse_csv_line(buffer);
-                        route.points[route.count++] = waypoint;
-                    }
+                else if(receiving && route.count < RouteStorage::MAX_WAYPOINTS){
+                    parse_csv_line(buffer, route.points[route.count++]);
                 }
             }
             index = 0;
@@ -775,6 +815,10 @@ void load_route(){
 int main() {
     compensator_config.lever_arm_m = lever_arm_m;
 
+    gpio_init(BUTTON_PIN);
+    gpio_set_dir(BUTTON_PIN, GPIO_IN);
+    gpio_pull_up(BUTTON_PIN);
+    
     uint32_t now_us = time_us_32();
     while(time_us_32() - now_us <= 1000000){
         if(gpio_get(BUTTON_PIN) == 0){
@@ -795,6 +839,9 @@ int main() {
 
 #ifdef PICOPILOT_ENABLE_DIAGNOSTICS
     if(!route_load_mode) stdio_init_all();
+    while (!stdio_usb_connected()) {
+        sleep_ms(100);
+    }
 #endif
     hardware_init();
 
