@@ -63,12 +63,15 @@ private:
     float integrator_ = 0.0f;
     float prev_error_ = 0.0f;
     float prev_derivative_ = 0.0f;
+    float last_output_ = 0.0f;
+    bool derivative_initialized_ = false;
 };
 
 class TECSController {
 public:
     TECSController();
     TECSOutputs update(const TECSInputs& in, float dt);
+    void reset();
 
 private:
     float k_h_ = 0.15f;
@@ -80,6 +83,7 @@ private:
 
     PIDController throttle_pid_;
     PIDController pitch_pid_;
+    TECSOutputs last_output_{0.5f, 0.0f};
 };
 
 class FlightController {

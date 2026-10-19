@@ -34,55 +34,101 @@ void PIDController::reset() {
     integrator_ = 0.0f;
     prev_error_ = 0.0f;
     prev_derivative_ = 0.0f;
+    last_output_ = 0.0f;
+    derivative_initialized_ = false;
 }
 
 float PIDController::update(float error, float dt) {
-    if (dt <= 1e-5f) return 0.0f;
+    if (!std::isfinite(error) || !std::isfinite(dt) || dt <= 1e-5f) {
+        return last_output_;
+    }
 
-    float p_out = kp_ * error;
+    const float p_out = kp_ * error;
 
-    integrator_ += error * dt;
-    integrator_ = std::clamp(integrator_, -i_max_, i_max_);
-    float i_out = ki_ * integrator_;
+    float derivative = 0.0f;
+    if (derivative_initialized_) {
+        const float raw_derivative = (error - prev_error_) / dt;
+        derivative = prev_derivative_ + d_filter_alpha_ * (raw_derivative - prev_derivative_);
+    } else {
+        derivative_initialized_ = true;
+    }
 
-    float raw_derivative = (error - prev_error_) / dt;
-    float derivative = prev_derivative_ + d_filter_alpha_ * (raw_derivative - prev_derivative_);
-    
     prev_error_ = error;
     prev_derivative_ = derivative;
-    
-    float d_out = kd_ * derivative;
+    const float d_out = kd_ * derivative;
 
-    return std::clamp(p_out + i_out + d_out, out_min_, out_max_);
+    const float candidate_integrator = std::clamp(integrator_ + error * dt, -i_max_, i_max_);
+    const float candidate_output = p_out + ki_ * candidate_integrator + d_out;
+    const float integral_drive = ki_ * error;
+
+    const bool windup_high = candidate_output > out_max_ && integral_drive > 0.0f;
+    const bool windup_low = candidate_output < out_min_ && integral_drive < 0.0f;
+
+    if (!windup_high && !windup_low) {
+        integrator_ = candidate_integrator;
+    }
+
+    last_output_ = std::clamp(
+        p_out + ki_ * integrator_ + d_out,
+        out_min_, out_max_
+    );
+    return last_output_;
 }
 
-TECSController::TECSController() 
-    : throttle_pid_(0.06f, 0.010f, 0.000f, -0.50f, 0.50f, 0.20f),  
-      pitch_pid_(0.12f, 0.005f, 0.008f, -0.35f, 0.35f, 0.15f)
-{}
+TECSController::TECSController()
+    : throttle_pid_(0.06f, 0.010f, 0.000f, -0.50f, 0.50f, 0.20f),
+      pitch_pid_(0.12f, 0.005f, 0.000f, -0.35f, 0.35f, 0.15f) {
+    last_output_ = {throttle_cruise_, pitch_trim_};
+}
+
+void TECSController::reset() {
+    throttle_pid_.reset();
+    pitch_pid_.reset();
+    last_output_ = {
+        std::clamp(throttle_cruise_, 0.0f, 1.0f),
+        std::clamp(pitch_trim_, -0.35f, 0.35f)
+    };
+}
 
 TECSOutputs TECSController::update(const TECSInputs& in, float dt) {
-    float e_h = in.h_set - in.h_curr;
-    float h_dot_set = std::clamp(e_h * k_h_, -max_climb_rate_, max_climb_rate_);
+    if (!std::isfinite(dt) || dt <= 1e-5f || dt > 0.5f ||
+        !std::isfinite(in.h_set) || !std::isfinite(in.h_curr) ||
+        !std::isfinite(in.h_dot_curr) || !std::isfinite(in.v_set) ||
+        !std::isfinite(in.v_curr) || !std::isfinite(in.v_dot_curr)) {
+        return last_output_;
+    }
 
-    float e_v = in.v_set - in.v_curr;
-    float v_dot_set = std::clamp(e_v * k_v_, -max_accel_, max_accel_);
+    const float e_h = in.h_set - in.h_curr;
+    const float h_dot_set = std::clamp(e_h * k_h_, -max_climb_rate_, max_climb_rate_);
 
-    float v_safe = std::max(in.v_curr, 3.0f); 
+    const float e_v = in.v_set - in.v_curr;
+    const float v_dot_set = std::clamp(e_v * k_v_, -max_accel_, max_accel_);
 
-    float H_dot_T_set = h_dot_set + (v_safe * v_dot_set) / G_ACCEL;
-    float H_dot_B_set = h_dot_set - (v_safe * v_dot_set) / G_ACCEL;
+    const float v = std::max(in.v_curr, 0.0f);
 
-    float H_dot_T_curr = in.h_dot_curr + (v_safe * in.v_dot_curr) / G_ACCEL;
-    float H_dot_B_curr = in.h_dot_curr - (v_safe * in.v_dot_curr) / G_ACCEL;
+    const float H_dot_T_set = h_dot_set + (v * v_dot_set) / G_ACCEL;
+    const float H_dot_B_set = h_dot_set - (v * v_dot_set) / G_ACCEL;
 
-    float e_T = H_dot_T_set - H_dot_T_curr;
-    float e_B = H_dot_B_set - H_dot_B_curr;
+    const float H_dot_T_curr = in.h_dot_curr + (v * in.v_dot_curr) / G_ACCEL;
+    const float H_dot_B_curr = in.h_dot_curr - (v * in.v_dot_curr) / G_ACCEL;
+
+    const float e_T = H_dot_T_set - H_dot_T_curr;
+    const float e_B = H_dot_B_set - H_dot_B_curr;
 
     TECSOutputs out;
     out.throttle = std::clamp(throttle_cruise_ + throttle_pid_.update(e_T, dt), 0.0f, 1.0f);
-    out.pitch_des_rad = pitch_trim_ + pitch_pid_.update(e_B, dt);
 
+    out.pitch_des_rad = std::clamp(
+        pitch_trim_ + pitch_pid_.update(e_B, dt),
+        pitch_trim_ - 0.35f,
+        pitch_trim_ + 0.35f)
+    ;
+
+    if (!std::isfinite(out.throttle) || !std::isfinite(out.pitch_des_rad)) {
+        return last_output_;
+    }
+
+    last_output_ = out;
     return out;
 }
 

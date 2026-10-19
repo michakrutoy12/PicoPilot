@@ -592,10 +592,13 @@ void core0_entry() {
 
     const bool route_loaded = route_loader.load(route);
     const bool route_ready = route_loaded && router.set_route(route);
+
+    if (AUTOPILOT_MODE_ROUTE && !route_ready) {
+        AUTOPILOT_MODE_ROUTE = false;
+    }
 #ifdef PICOPILOT_ENABLE_DIAGNOSTICS
     if (AUTOPILOT_MODE_ROUTE && !route_ready) {
         printf("Route autopilot requested, but no valid route is loaded.\n");
-        AUTOPILOT_MODE_ROUTE = false;
     }
     if (route_loaded) print_route(&route);
 #endif
