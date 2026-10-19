@@ -4,8 +4,7 @@
 
 namespace {
 
-constexpr double PI = 3.14159265358979323846;
-constexpr double DEG_TO_RAD = PI / 180.0;
+constexpr double DEG_TO_RAD = M_PI / 180.0;
 
 } // namespace
 
@@ -42,7 +41,7 @@ float calculate_orbit_bearing(double lat, double lon, double center_lat, double 
     double error = distance - radius;
     double correction = std::atan2(error, radius);
     double bearing = tangent - correction;
-    bearing = std::fmod(bearing + 2.0 * PI, 2.0 * PI);
+    bearing = std::fmod(bearing + 2.0 * M_PI, 2.0 * M_PI);
 
     return static_cast<float>(bearing);
 }
@@ -60,6 +59,7 @@ bool Router::set_route(const RouteStorage::Route& route) {
     }
 
     route_ = route;
+    route_.current_waypoint = 0;
     route_active = true;
     waypoint_departure_required_ = false;
 
@@ -67,8 +67,21 @@ bool Router::set_route(const RouteStorage::Route& route) {
 }
 
 void Router::update(const RouterInputs& inputs, RouterOutputs& outputs) {
-    if (!route_active ||
-        route_.current_waypoint >= route_.count) {
+    if (route_.current_waypoint >= route_.count) {
+        outputs.route_active = false;
+        return;
+    }
+
+    if (!route_active) {
+        const auto& last = route_.points[route_.current_waypoint];
+        outputs.altitude = last.altitude;
+        outputs.speed = last.speed;
+        outputs.bearing = calculate_bearing(
+            inputs.lat,
+            inputs.lon,
+            last.latitude,
+            last.longitude
+        );
         outputs.route_active = false;
         return;
     }

@@ -131,7 +131,7 @@ void Neo6M::process_rmc(std::string_view line) {
         return;
     }
 
-    if (!s_speed.empty()) speed = to_float(s_speed) * 0.514f; 
+    if (!s_speed.empty()) speed = to_float(s_speed) * 0.514f;
     if (s_time.length() >= 6) gps_time = to_long(s_time);
     if (s_date.length() == 6) gps_date = to_long(s_date);
     if (!s_course.empty()) {

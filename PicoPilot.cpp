@@ -65,6 +65,8 @@
 #define IMU_INT_PIN 2
 /* ======================= */
 
+bool AUTOPILOT_MODE_ROUTE = false;
+
 const uint8_t BUTTON_PIN = 14;
 bool route_load_mode = false;
 const uint8_t MAX_LINE_LENGTH = 64;
@@ -154,6 +156,8 @@ volatile uint32_t interruptTime, previousTime = 0;
 /* === */
 
 static TelemetryPacket tx_packet_buffer;
+
+constexpr double DEG_TO_RAD = M_PI / 180.0;
 
 float map(float x, float in_min, float in_max, float out_min, float out_max) {
     return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
@@ -526,7 +530,8 @@ void core1_entry() {
         gyro_clean = {
             sensors.gyro.x - bx,
             sensors.gyro.y - by,
-            sensors.gyro.z - bz};
+            sensors.gyro.z - bz
+        };
 
         compensator.process(
             sensors.accel,
@@ -538,7 +543,7 @@ void core1_entry() {
         );
 
         ekf.set_r_accel(adapted_r);
-        ekf.correctYawDrift(sensors.course, sensors.speed, dt);
+        ekf.correctYawDrift(sensors.course * DEG_TO_RAD, sensors.speed, dt);
 
         ekf.predict(gyro_clean.x, gyro_clean.y, gyro_clean.z, dt);
 
@@ -582,14 +587,18 @@ void core0_entry() {
     Avionics::FlightController flight_controller;
     Avionics::TECSController tecs_controller;
 
-    RouteStorage::Route route;
+    RouteStorage::Route route {};
     Avionics::Router router;
 
-    route_loader.load(route);
+    const bool route_loaded = route_loader.load(route);
+    const bool route_ready = route_loaded && router.set_route(route);
 #ifdef PICOPILOT_ENABLE_DIAGNOSTICS
-    print_route(&route);
+    if (AUTOPILOT_MODE_ROUTE && !route_ready) {
+        printf("Route autopilot requested, but no valid route is loaded.\n");
+        AUTOPILOT_MODE_ROUTE = false;
+    }
+    if (route_loaded) print_route(&route);
 #endif
-    // router.set_route(route);
 
     uint32_t last_bme_read_us = 0;
     const uint32_t BME_READ_INTERVAL_US = 20000;
@@ -601,6 +610,10 @@ void core0_entry() {
     constexpr uint32_t CONTROL_INTERVAL_US = 2500;
     constexpr uint32_t MAX_IMU_AGE_US = 50000;
     constexpr uint32_t CORE1_STALE_TIMEOUT_US = 100000;
+    constexpr uint32_t MAX_GPS_AGE_US = 1500000;
+    constexpr float RTH_ALTITUDE_CLEARANCE_M = 30.0f;
+    constexpr float RTH_ORBIT_RADIUS_M = 60.0f;
+    constexpr float RTH_DEFAULT_SPEED_M_S = 15.0f;
 
 #ifdef PICOPILOT_ENABLE_DIAGNOSTICS
     constexpr uint32_t DIAGNOSTICS_INTERVAL_US = 1000000;
@@ -609,6 +622,12 @@ void core0_entry() {
 
     float target_altitude_m = 0.0f;
     bool altitude_hold_captured = false;
+    float target_course_rad = 0.0f;
+    bool course_hold_captured = false;
+    float last_speed_target_m_s = RTH_DEFAULT_SPEED_M_S;
+    float rth_altitude_m = 0.0f;
+    bool rth_altitude_captured = false;
+    bool rth_active = false;
     float v_dot_filtered = 0.0f;
 
     while (true) {
@@ -623,8 +642,11 @@ void core0_entry() {
         char c;
         while (gps_ring_buffer.pop(c)) {
             if (gps.update(c)) {
-                if (!home_set && gps.satellites >= 4 && gps.hdop > 0.0f && gps.hdop < 3.5f && 
-                    std::abs(gps.latitude) > 0.001 && std::abs(gps.longitude) > 0.001) {
+                if (!home_set && gps.fix_state > 0 && gps.satellites >= 4 &&
+                    gps.hdop > 0.0f && gps.hdop < 3.5f &&
+                    std::isfinite(gps.latitude) && gps.latitude >= -90.0 && gps.latitude <= 90.0 &&
+                    std::isfinite(gps.longitude) && gps.longitude >= -180.0 && gps.longitude <= 180.0 &&
+                    std::isfinite(gps.altitude)) {
                     home_lat = gps.latitude;
                     home_lon = gps.longitude;
                     home_altitude = gps.altitude;
@@ -675,34 +697,86 @@ void core0_entry() {
             ekf = get_ekf_on_core0();
             bool imu_ok = current_sensors.imu_timestamp_us != 0 &&
                           (now_us - current_sensors.imu_timestamp_us) < MAX_IMU_AGE_US;
+            bool gps_ok = current_sensors.gps_timestamp_us != 0 &&
+                          (now_us - current_sensors.gps_timestamp_us) < MAX_GPS_AGE_US &&
+                          current_sensors.satellites >= 4 &&
+                          current_sensors.hdop > 0.0f &&
+                          current_sensors.hdop < 5.0f &&
+                          std::isfinite(current_sensors.lat) &&
+                          std::isfinite(current_sensors.lon) &&
+                          std::isfinite(current_sensors.speed) &&
+                          std::isfinite(current_sensors.course);
+            const bool rth_requested = !signal_ok;
 
-            if (!signal_ok) {
-                // FailSafe, home return
-                set_pwm(THROTTLE_PIN, 1040);
-                set_pwm(ROLL_PIN, 1500);
-                set_pwm(PITCH_PIN, 1500);
-                set_pwm(YAW_PIN, 1500);
+            if (rth_requested && home_set && !rth_altitude_captured) {
+                rth_altitude_m = std::max(
+                    ekf.altitude,
+                    home_altitude + RTH_ALTITUDE_CLEARANCE_M
+                );
+                rth_altitude_captured = true;
+            } else if (!rth_requested) {
+                rth_altitude_captured = false;
+            }
+
+            if (!rth_requested && rth_active) {
                 altitude_hold_captured = false;
-            } else if (pulses[4] < 1500) {
+                course_hold_captured = false;
+            }
+            rth_active = rth_requested;
+
+            if (signal_ok && pulses[5] >= 1200) {
+                last_speed_target_m_s = std::clamp(
+                    map(pulses[5], 900.0f, 2200.0f, 0.0f, 27.0f),
+                    0.0f,
+                    27.0f
+                );
+            }
+
+            uint16_t outputs[4];
+
+            if (rth_requested && (!home_set || !gps_ok)) {
+                // RTH is not possible without a saved home position and fresh GPS.
+                outputs[0] = 1040;
+                outputs[1] = 1500;
+                outputs[2] = 1500;
+                outputs[3] = 1500;
+            } else if (signal_ok && pulses[4] < 1500) {
                 // Direct control
-                set_pwm(THROTTLE_PIN, pulses[2]);
-                set_pwm(ROLL_PIN, pulses[0]);
-                set_pwm(PITCH_PIN, pulses[1]);
-                set_pwm(YAW_PIN, pulses[3]);
+                outputs[0] = pulses[2];
+                outputs[1] = pulses[0];
+                outputs[2] = pulses[1];
+                outputs[3] = pulses[3];
                 altitude_hold_captured = false;
+                course_hold_captured = false;
             } else if (!core1_healthy || !imu_ok) {
                 // Critical Failure
-                set_pwm(THROTTLE_PIN, 1040);
-                set_pwm(ROLL_PIN, 1500);
-                set_pwm(PITCH_PIN, 1500);
-                set_pwm(YAW_PIN, 1500);
+                outputs[0] = 1040;
+                outputs[1] = 1500;
+                outputs[2] = 1500;
+                outputs[3] = 1500;
                 altitude_hold_captured = false;
+                course_hold_captured = false;
+            } else if (AUTOPILOT_MODE_ROUTE && !rth_requested && (!route_ready || !gps_ok)) {
+                // Route mode requires an active route and fresh GPS.
+                outputs[0] = 1040;
+                outputs[1] = 1500;
+                outputs[2] = 1500;
+                outputs[3] = 1500;
+                altitude_hold_captured = false;
+                course_hold_captured = false;
             } else {
                 Avionics::Quaternion q_curr = {ekf.q1, ekf.q2, ekf.q3, ekf.q4};
                 Avionics::Vector3 gyro_rad_s = {-imu.gx, -imu.gy, imu.gz};
                 float yaw_curr_rad = get_yaw_from_quaternion(ekf.q1, ekf.q2, ekf.q3, ekf.q4);
 
-                if (!altitude_hold_captured) {
+                if (!rth_requested && !AUTOPILOT_MODE_ROUTE && !course_hold_captured) {
+                    target_course_rad = gps_ok && current_sensors.speed >= 1.0f
+                        ? current_sensors.course * static_cast<float>(DEG_TO_RAD)
+                        : yaw_curr_rad;
+                    course_hold_captured = true;
+                }
+
+                if (!rth_requested && !AUTOPILOT_MODE_ROUTE && !altitude_hold_captured) {
                     target_altitude_m = ekf.altitude;
                     altitude_hold_captured = true;
                 }
@@ -715,9 +789,61 @@ void core0_entry() {
                 tecs_in.h_set = target_altitude_m;
                 tecs_in.h_curr = ekf.altitude;
                 tecs_in.h_dot_curr = ekf.vertical_speed;
-                tecs_in.v_set = map(pulses[5], 900.0f, 2200.0f, 0.0f, 27.0f);
-                tecs_in.v_curr = std::max(current_sensors.speed, 15.0f);
+                tecs_in.v_set = last_speed_target_m_s;
+                tecs_in.v_curr = gps_ok
+                    ? std::max(current_sensors.speed, 7.0f)
+                    : 15.0f;
                 tecs_in.v_dot_curr = v_dot_filtered;
+
+                float desired_course_rad = target_course_rad;
+                bool use_tecs_throttle = rth_requested;
+                if (rth_requested) {
+                    tecs_in.h_set = rth_altitude_m;
+                    if (current_sensors.home_distance > 2.0f * RTH_ORBIT_RADIUS_M) {
+                        desired_course_rad = calculate_bearing(
+                            current_sensors.lat,
+                            current_sensors.lon,
+                            home_lat,
+                            home_lon
+                        );
+                    } else {
+                        desired_course_rad = calculate_orbit_bearing(
+                            current_sensors.lat,
+                            current_sensors.lon,
+                            home_lat,
+                            home_lon,
+                            RTH_ORBIT_RADIUS_M,
+                            true
+                        );
+                    }
+                } else if (AUTOPILOT_MODE_ROUTE) {
+                    Avionics::RouterInputs nav_in {
+                        current_sensors.lat,
+                        current_sensors.lon
+                    };
+                    Avionics::RouterOutputs nav_out {};
+                    router.update(nav_in, nav_out);
+
+                    tecs_in.h_set = nav_out.altitude;
+                    tecs_in.v_set = nav_out.speed;
+                    if (nav_out.route_active) {
+                        desired_course_rad = nav_out.bearing;
+                    } else {
+                        desired_course_rad = current_sensors.course *
+                                             static_cast<float>(DEG_TO_RAD);
+                    }
+                    use_tecs_throttle = true;
+                }
+
+                const float measured_course_rad =
+                    gps_ok && current_sensors.speed >= 1.0f
+                        ? current_sensors.course * static_cast<float>(DEG_TO_RAD)
+                        : yaw_curr_rad;
+                flight_controller.updateGPSCourse(
+                    desired_course_rad,
+                    measured_course_rad,
+                    gps_ok ? current_sensors.speed : 0.0f
+                );
 
                 Avionics::TECSOutputs tecs_out = tecs_controller.update(tecs_in, dt_ctrl);
                 Avionics::ServoOutputs servos = flight_controller.updateAttitude(
@@ -729,15 +855,17 @@ void core0_entry() {
                     tecs_out
                 );
 
-                if(pulses[5] < 1200){
-                    set_pwm(THROTTLE_PIN, pulses[2]);
-                } else {
-                    set_pwm(THROTTLE_PIN, throttle_to_pwm(servos.throttle));
-                }
-                set_pwm(ROLL_PIN, servo_to_pwm(-servos.aileron));
-                set_pwm(PITCH_PIN, servo_to_pwm(servos.elevator));
-                set_pwm(YAW_PIN, servo_to_pwm(-servos.rudder));
+                if (!use_tecs_throttle && pulses[5] < 1200) outputs[0] = pulses[2];
+                else outputs[0] = throttle_to_pwm(servos.throttle);
+
+                outputs[1] = servo_to_pwm(-servos.aileron);
+                outputs[2] = servo_to_pwm(servos.elevator);
+                outputs[3] = servo_to_pwm(-servos.rudder);
             }
+            set_pwm(THROTTLE_PIN, outputs[0]);
+            set_pwm(ROLL_PIN, outputs[1]);
+            set_pwm(PITCH_PIN, outputs[2]);
+            set_pwm(YAW_PIN, outputs[3]);
         }
 
         if (now_us - last_telemetry_tx_us >= TELEMETRY_INTERVAL_US) {
@@ -774,7 +902,7 @@ void load_route(){
     uint8_t index = 0;
     bool receiving = false;
 
-    RouteStorage::Route route;
+    RouteStorage::Route route {};
 
     while(true){
         int c = getchar_timeout_us(0);
