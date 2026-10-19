@@ -19,8 +19,8 @@ struct Waypoint {
 
 struct Route {
     uint16_t current_waypoint;
-    uint32_t magic;
-    uint16_t version;
+    uint32_t magic = ROUTE_MAGIC;
+    uint16_t version = ROUTE_VERSION;
     uint16_t count;
     Waypoint points[MAX_WAYPOINTS];
 };

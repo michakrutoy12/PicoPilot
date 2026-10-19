@@ -1,11 +1,11 @@
 #include "pico/stdlib.h"
 #include "pico/flash.h"
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
-#ifdef PICOPILOT_ENABLE_DIAGNOSTICS
 #include "pico/stdio_usb.h"
+#include "stdio.h"
 #include <cstdio>
-#endif
 
 #include "pico/multicore.h"
 #include "hardware/sync.h"
@@ -64,6 +64,12 @@
 #define SCL_PIN 21
 #define IMU_INT_PIN 2
 /* ======================= */
+
+const uint8_t BUTTON_PIN = 14;
+bool route_load_mode = false;
+const uint8_t MAX_LINE_LENGTH = 128;
+
+RouteStorage::RouteLoader route_loader;
 
 int telemetry_dma_chan = -1;
 
@@ -429,6 +435,11 @@ void hardware_init() {
 
     sensor_lock = spin_lock_init(spin_lock_claim_unused(true));
     ekf_lock = spin_lock_init(spin_lock_claim_unused(true));
+
+    gpio_init(BUTTON_PIN);
+    gpio_set_dir(BUTTON_PIN, GPIO_IN);
+    gpio_pull_up(BUTTON_PIN);
+
 }
 
 void core1_entry() {
@@ -528,6 +539,12 @@ void core0_entry() {
 
     Avionics::FlightController flight_controller;
     Avionics::TECSController tecs_controller;
+
+    RouteStorage::Route route;
+    Avionics::Router router;
+
+    route_loader.load(route);
+    // router.set_route(route);
 
     uint32_t last_bme_read_us = 0;
     const uint32_t BME_READ_INTERVAL_US = 20000;
@@ -690,14 +707,98 @@ void core0_entry() {
     }
 }
 
+RouteStorage::Waypoint parse_csv_line(char* line) {
+    RouteStorage::Waypoint waypoint = {0};
+
+    char* token = strtok(line, ",");
+    if (token != NULL) waypoint.latitude = strtod(token, NULL);
+
+    token = strtok(NULL, ",");
+    if (token != NULL) waypoint.longitude = strtod(token, NULL);
+
+    token = strtok(NULL, ",");
+    if (token != NULL) waypoint.altitude = strtof(token, NULL);
+
+    token = strtok(NULL, ",");
+    if (token != NULL) waypoint.speed = strtof(token, NULL);
+
+    return waypoint;
+}
+
+
+void load_route(){
+    char buffer[MAX_LINE_LENGTH];
+    uint8_t index = 0;
+    bool receiving = false;
+
+    RouteStorage::Route route;
+
+    while(true){
+        int c = getchar_timeout_us(0);
+        if(c == PICO_ERROR_TIMEOUT) continue;
+
+        if(c == '\n' || index >= MAX_LINE_LENGTH - 1){
+            buffer[index] = '\0';
+            
+            if(index > 0){
+                if(strcmp(buffer, "START") == 0){
+                    route.count = 0;
+                    receiving = true;
+                    printf("Ready to receive a route.\n");
+                } 
+
+                else if(strcmp(buffer, "END") == 0){
+                    if(receiving){
+                        if(!route_loader.save(route)){
+                            printf("Failed to save the route!\n");
+                            continue;
+                        }
+                        printf("Successfully saved the route!\n");
+                        break;
+                    }
+                } 
+                else if(receiving){
+                    if(route.count < RouteStorage::MAX_WAYPOINTS){
+                        RouteStorage::Waypoint waypoint = parse_csv_line(buffer);
+                        route.points[route.count++] = waypoint;
+                    }
+                }
+            }
+            index = 0;
+        } else if(c != '\r'){
+            buffer[index++] = (char)c;
+        }
+    }
+}
+
+
 int main() {
-    watchdog_enable(1000, true);
     compensator_config.lever_arm_m = lever_arm_m;
 
+    uint32_t now_us = time_us_32();
+    while(time_us_32() - now_us <= 1000000){
+        if(gpio_get(BUTTON_PIN) == 0){
+            route_load_mode = true;
+            break;
+        }
+    }
+
+    if(route_load_mode){
+        stdio_init_all();
+        while (!stdio_usb_connected()) {
+            sleep_ms(100);
+        }
+        printf("USB connected.\n");
+
+        load_route();
+    }
+
 #ifdef PICOPILOT_ENABLE_DIAGNOSTICS
-    stdio_init_all();
+    if(!route_load_mode) stdio_init_all();
 #endif
     hardware_init();
+
+    watchdog_enable(1000, true);
 
     core1_heartbeat_us = time_us_32();
     multicore_launch_core1(&core1_entry);
