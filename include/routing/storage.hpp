@@ -29,8 +29,11 @@ class RouteLoader {
 public:
     RouteLoader() = default;
 
+    // Reads and validates the stored route, clearing the result if invalid.
     bool load(Route& route);
+    // Checks route metadata and waypoint coordinates and values.
     bool validate(const Route& route) const;
+    // Validates a route and writes it to its reserved flash sector.
     bool save(const Route& route);
 };
 

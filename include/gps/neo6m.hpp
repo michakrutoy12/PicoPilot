@@ -18,18 +18,25 @@ public:
     uint gps_time = 0;
     uint gps_date = 0;
 
+    // Creates a parser with a reserved buffer for incoming NMEA sentences.
     Neo6M();
     
+    // Adds one character and reports when a sentence updates navigation data.
     bool update(char c);
 
 private:
     std::string buffer;
     bool data_updated = false;
     
+    // Dispatches a complete NMEA sentence to its message-specific parser.
     void parse_line(std::string_view line);
+    // Updates position, fix quality, and altitude from a GGA sentence.
     void process_gga(std::string_view line);
+    // Updates speed, course, and time from a valid RMC sentence.
     void process_rmc(std::string_view line);
+    // Updates speed from a VTG sentence.
     void process_vtg(std::string_view line);
     
+    // Returns a comma-separated field from an NMEA sentence.
     std::string_view get_field(std::string_view line, int field_index);
 };

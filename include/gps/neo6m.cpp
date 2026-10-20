@@ -2,6 +2,7 @@
 #include <pico/stdlib.h>
 
 namespace {
+    // Parses a numeric NMEA field as a float, using the fallback on failure.
     float to_float(std::string_view sv, float default_val = 0.0f) {
         if (sv.empty()) return default_val;
         float val;
@@ -9,6 +10,7 @@ namespace {
         return (ec == std::errc{}) ? val : default_val;
     }
 
+    // Parses a numeric NMEA field as a double, using the fallback on failure.
     double to_double(std::string_view sv, double default_val = 0.0f) {
         if (sv.empty()) return default_val;
         double val;
@@ -16,6 +18,7 @@ namespace {
         return (ec == std::errc{}) ? val : default_val;
     }
 
+    // Parses an integer NMEA field, optionally using a non-decimal base.
     long to_long(std::string_view sv, int base = 10, long default_val = 0) {
         if (sv.empty()) return default_val;
         long val;

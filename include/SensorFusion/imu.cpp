@@ -6,6 +6,7 @@
 
 #include <cstring>
 
+// Approximates the reciprocal square root for quaternion normalization.
 inline float fastInvSqrt(float x) {
     if (x <= 1e-12f || !std::isfinite(x)) return 0.0f;
 

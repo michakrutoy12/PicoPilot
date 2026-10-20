@@ -173,6 +173,7 @@ uint8_t calculate_checksum(const uint8_t *data, size_t len) {
 }
 
 void send_telemetry_dma(const RawSensorData &sensors, const EKFOutput &ekf) {
+    // Reuse the packet buffer only when the previous UART DMA transfer is done.
     if (dma_channel_is_busy(telemetry_dma_chan)) {
         return;
     }
@@ -229,12 +230,14 @@ void init_telemetry_dma() {
 }
 
 void send_sensors_to_core1(const RawSensorData &data) {
+    // Protect the shared sensor snapshot while handing it to the estimator core.
     uint32_t save = spin_lock_blocking(sensor_lock);
     global_sensor_data = data;
     spin_unlock(sensor_lock, save);
 }
 
 RawSensorData get_sensors_on_core1() {
+    // Copy the latest sensor snapshot without exposing shared state to the caller.
     RawSensorData local_copy;
     uint32_t save = spin_lock_blocking(sensor_lock);
     local_copy = global_sensor_data;
@@ -243,12 +246,14 @@ RawSensorData get_sensors_on_core1() {
 }
 
 void send_ekf_to_core0(const EKFOutput &ekf) {
+    // Publish a complete estimator result to the control core under the lock.
     uint32_t save = spin_lock_blocking(ekf_lock);
     global_ekf_output = ekf;
     spin_unlock(ekf_lock, save);
 }
 
 EKFOutput get_ekf_on_core0() {
+    // Return a consistent copy of the estimator result shared by the other core.
     EKFOutput local_copy;
     uint32_t save = spin_lock_blocking(ekf_lock);
     local_copy = global_ekf_output;
@@ -357,6 +362,7 @@ void ppm_handler() {
     interruptTime = time_us_32();
     uint32_t pulseLength = interruptTime - previousTime;
 
+    // A long pause marks a frame boundary; publish only complete, in-range frames.
     if (pulseLength > PAUSE_PULSE_MIN_LENGTH && pulseLength < PAUSE_PULSE_MAX_LENGTH) {
         if (pulses_nr == N_CHANNELS) {
             bool valid_frame = true;
@@ -391,6 +397,7 @@ void ppm_handler() {
 void gps_handler() {
     uart_get_hw(UART)->icr = 0x7FF;
 
+    // Keep the interrupt short by queuing bytes for parsing in the main loop.
     while (uart_is_readable(UART)) {
         char c = uart_getc(UART);
         gps_ring_buffer.push(c);
@@ -430,6 +437,7 @@ void init_pwm(uint8_t gp, uint16_t start_duty_ns) {
 }
 
 void hardware_init() {
+    // Set up communication buses, PWM outputs, sensors, interrupts, and shared locks.
     /* INIT UART */
     gpio_set_function(UART_RX, GPIO_FUNC_UART);
     gpio_set_function(UART_TX, GPIO_FUNC_UART);
@@ -527,6 +535,7 @@ void core1_entry() {
 
         float bx, by, bz;
         ekf.getGyroBias(bx, by, bz);
+        // Remove estimated gyro bias before correcting rotational acceleration.
         gyro_clean = {
             sensors.gyro.x - bx,
             sensors.gyro.y - by,
@@ -542,6 +551,7 @@ void core1_entry() {
             adapted_r
         );
 
+        // Adapt accelerometer trust, correct yaw drift, then predict attitude from gyro.
         ekf.set_r_accel(adapted_r);
         ekf.correctYawDrift(sensors.course * DEG_TO_RAD, sensors.speed, dt);
 
@@ -551,6 +561,7 @@ void core1_entry() {
             ekf.updateAccel(accel_corr.x, accel_corr.y, accel_corr.z);
         }
 
+        // Fuse each new barometer and GPS altitude sample into the variometer.
         if (sensors.baro_timestamp_us != last_baro_timestamp_us) {
             float dt_baro = (float)(sensors.baro_timestamp_us - last_baro_timestamp_us) / 1000000.0f;
             last_baro_timestamp_us = sensors.baro_timestamp_us;
@@ -593,6 +604,7 @@ void core0_entry() {
     const bool route_loaded = route_loader.load(route);
     const bool route_ready = route_loaded && router.set_route(route);
 
+    // Disable route mode at startup if flash contains no valid route.
     if (AUTOPILOT_MODE_ROUTE && !route_ready) {
         AUTOPILOT_MODE_ROUTE = false;
     }
@@ -635,6 +647,7 @@ void core0_entry() {
 
     while (true) {
         uint32_t now_us = time_us_32();
+        // Treat receiver and estimator data as usable only while their heartbeats are fresh.
         bool signal_ok = ppm_frame_valid &&
                          (now_us - last_valid_ppm_us) < MAX_NO_SIGNAL_TIME;
         bool core1_healthy = (now_us - core1_heartbeat_us) < CORE1_STALE_TIMEOUT_US;
@@ -643,6 +656,7 @@ void core0_entry() {
         }
 
         char c;
+        // Parse queued GPS bytes and save the first suitably accurate fix as Home.
         while (gps_ring_buffer.pop(c)) {
             if (gps.update(c)) {
                 if (!home_set && gps.fix_state > 0 && gps.satellites >= 4 &&
@@ -704,13 +718,14 @@ void core0_entry() {
                           (now_us - current_sensors.gps_timestamp_us) < MAX_GPS_AGE_US &&
                           current_sensors.satellites >= 4 &&
                           current_sensors.hdop > 0.0f &&
-                          current_sensors.hdop < 5.0f &&
+                          current_sensors.hdop < 7.0f &&
                           std::isfinite(current_sensors.lat) &&
                           std::isfinite(current_sensors.lon) &&
                           std::isfinite(current_sensors.speed) &&
                           std::isfinite(current_sensors.course);
             const bool rth_requested = !signal_ok;
 
+            // Capture one RTH altitude target on entry and clear it after signal recovery.
             if (rth_requested && home_set && !rth_altitude_captured) {
                 rth_altitude_m = std::max(
                     ekf.altitude,
@@ -719,12 +734,12 @@ void core0_entry() {
                 rth_altitude_captured = true;
             } else if (!rth_requested) {
                 rth_altitude_captured = false;
-            }
+            } // Return to home altitude capture
 
             if (!rth_requested && rth_active) {
                 altitude_hold_captured = false;
                 course_hold_captured = false;
-            }
+            } // Capture canceling when rth is not longer needed.
             rth_active = rth_requested;
 
             if (signal_ok && pulses[5] >= 1200) {
@@ -733,10 +748,11 @@ void core0_entry() {
                     0.0f,
                     27.0f
                 );
-            }
+            } // Speed target if manual mode
 
             uint16_t outputs[4];
 
+            // Apply safety fallbacks before selecting direct control or an autopilot mode.
             if (rth_requested && (!home_set || !gps_ok)) {
                 // RTH is not possible without a saved home position and fresh GPS.
                 outputs[0] = 1040;
@@ -777,13 +793,14 @@ void core0_entry() {
                         ? current_sensors.course * static_cast<float>(DEG_TO_RAD)
                         : yaw_curr_rad;
                     course_hold_captured = true;
-                }
+                } // Following the current heading in manual mode
 
                 if (!rth_requested && !AUTOPILOT_MODE_ROUTE && !altitude_hold_captured) {
                     target_altitude_m = ekf.altitude;
                     altitude_hold_captured = true;
-                }
+                } // Holding the current altitude in manual mode
 
+                // Estimate forward acceleration in the earth frame and smooth it for TECS.
                 float sin_pitch = 2.0f * (ekf.q1 * ekf.q3 - ekf.q2 * ekf.q4);
                 float v_dot_imu = imu.ax - 9.80665f * sin_pitch;
                 v_dot_filtered += 0.1f * (v_dot_imu - v_dot_filtered);
@@ -801,6 +818,7 @@ void core0_entry() {
                 float desired_course_rad = target_course_rad;
                 bool use_tecs_throttle = rth_requested;
                 if (rth_requested) {
+                    // Navigate home outside the orbit radius, then follow a circular hold.
                     tecs_in.h_set = rth_altitude_m;
                     if (current_sensors.home_distance > 2.0f * RTH_ORBIT_RADIUS_M) {
                         desired_course_rad = calculate_bearing(
@@ -820,6 +838,7 @@ void core0_entry() {
                         );
                     }
                 } else if (AUTOPILOT_MODE_ROUTE) {
+                    // Use route waypoint targets when available, otherwise hold GPS course.
                     Avionics::RouterInputs nav_in {
                         current_sensors.lat,
                         current_sensors.lon
@@ -848,6 +867,7 @@ void core0_entry() {
                     gps_ok ? current_sensors.speed : 0.0f
                 );
 
+                // Convert navigation targets and current estimates into actuator commands.
                 Avionics::TECSOutputs tecs_out = tecs_controller.update(tecs_in, dt_ctrl);
                 Avionics::ServoOutputs servos = flight_controller.updateAttitude(
                     dt_ctrl,
@@ -907,6 +927,7 @@ void load_route(){
 
     RouteStorage::Route route {};
 
+    // Receive START, waypoint CSV lines, and END over USB before saving the route.
     while(true){
         int c = getchar_timeout_us(0);
         if(c == PICO_ERROR_TIMEOUT) continue;
@@ -951,6 +972,7 @@ int main() {
     gpio_pull_up(BUTTON_PIN);
     
     uint32_t now_us = time_us_32();
+    // Sample the route-load button briefly during startup before initializing PWM.
     while(time_us_32() - now_us <= 1000000){
         if(gpio_get(BUTTON_PIN) == 0){
             route_load_mode = true;

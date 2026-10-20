@@ -5,6 +5,7 @@
 template <size_t Size>
 class RingBuffer {
 public:
+    // Adds a character unless the buffer is full.
     bool push(char c) {
         size_t next = (head_ + 1) % Size;
         if (next == tail_) return false;
@@ -13,6 +14,7 @@ public:
         return true;
     }
 
+    // Removes the oldest character unless the buffer is empty.
     bool pop(char& c) {
         if (head_ == tail_) return false;
         c = buffer_[tail_];
@@ -20,6 +22,7 @@ public:
         return true;
     }
 
+    // Reports whether the buffer contains no characters.
     bool empty() const { return head_ == tail_; }
 
 private:

@@ -5,16 +5,19 @@
 
 class Variometer {
 public:
+    // Creates the altitude filter with accelerometer and barometer-drift noise.
     explicit Variometer(float accel_noise = 0.8f, float baro_drift_noise = 0.005f) {
         set_noise(accel_noise, baro_drift_noise);
         reset();
     }
 
+    // Updates the process-noise values used during prediction.
     void set_noise(float accel_noise, float baro_drift_noise) {
         q_accel_sq_ = accel_noise * accel_noise;
         q_baro_drift_sq_ = baro_drift_noise * baro_drift_noise;
     }
 
+    // Resets altitude, vertical speed, bias, and covariance state.
     void reset() {
         x_[0] = 0.0f; 
         x_[1] = 0.0f;
@@ -30,6 +33,7 @@ public:
         initialized_ = false;
     }
 
+    // Converts atmospheric pressure in pascals to standard-atmosphere altitude.
     static float pressure_to_altitude(float pressure_pa) {
         if (pressure_pa < 100.0f || !std::isfinite(pressure_pa)) {
             pressure_pa = 100.0f; 
@@ -38,6 +42,7 @@ public:
         return 44330.0f * (1.0f - std::pow(pressure_pa * inv_p0, 0.190295f));
     }
 
+    // Predicts the state and corrects it with a barometric altitude measurement.
     void update_baro(float baro_alt, float dt_sec, float r_baro = 0.25f) {
         if (!initialized_) {
             x_[0] = baro_alt;
@@ -74,6 +79,7 @@ public:
         P22_ -= K2 * M2;
     }
 
+    // Predicts the state and corrects altitude using GPS altitude and VDOP.
     void update_gps(float gps_alt, float dt_sec, float vdop = 1.0f) {
         if (!initialized_) {
             x_[0] = gps_alt;
@@ -113,8 +119,11 @@ public:
         P22_ -= K2 * M2;
     }
 
+    // Returns the current fused altitude estimate.
     float get_altitude()       const { return x_[0]; }
+    // Returns the current vertical-speed estimate.
     float get_vertical_speed() const { return x_[1]; }
+    // Returns the estimated barometer altitude bias.
     float get_baro_bias()      const { return x_[2]; }
 
 private:
@@ -128,6 +137,7 @@ private:
     float q_baro_drift_sq_;
     bool initialized_ = false;
 
+    // Advances the altitude state and covariance by one timestep.
     void predict(float dt) {
         if (dt <= 0.0f) return;
 

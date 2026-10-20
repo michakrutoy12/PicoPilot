@@ -1,5 +1,6 @@
 #include "control.hpp"
 
+// Replaces non-finite control values with a safe fallback.
 inline float sanitize(float val, float default_val = 0.0f) {
     return std::isfinite(val) ? val : default_val;
 }

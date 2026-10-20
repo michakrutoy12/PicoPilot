@@ -11,10 +11,12 @@ struct Vector3 {
 struct Quaternion {
     float w, x, y, z;
 
+    // Returns the conjugate, used as the inverse for unit quaternions.
     [[nodiscard]] Quaternion conjugate() const {
         return {w, -x, -y, -z};
     }
 
+    // Multiplies this quaternion by another quaternion.
     [[nodiscard]] Quaternion operator*(const Quaternion& q) const {
         return {
             w * q.w - x * q.x - y * q.y - z * q.z,
@@ -24,6 +26,7 @@ struct Quaternion {
         };
     }
 
+    // Converts roll, pitch, and yaw angles to a quaternion.
     [[nodiscard]] static Quaternion fromEuler(float roll, float pitch, float yaw);
 };
 
@@ -50,9 +53,12 @@ struct ServoOutputs {
 
 class PIDController {
 public:
+    // Configures PID gains, output limits, integrator limit, and derivative filtering.
     PIDController(float kp, float ki, float kd, float out_min, float out_max, float i_max, float d_filter_alpha = 1.0f);
 
+    // Clears the controller's accumulated and previous state.
     void reset();
+    // Computes a bounded PID output for the supplied error and timestep.
     float update(float error, float dt);
 
 private:
@@ -69,8 +75,11 @@ private:
 
 class TECSController {
 public:
+    // Creates the throttle and pitch controllers with their default gains.
     TECSController();
+    // Computes throttle and pitch targets from altitude and speed errors.
     TECSOutputs update(const TECSInputs& in, float dt);
+    // Resets both controllers and restores their initial output.
     void reset();
 
 private:
@@ -88,10 +97,13 @@ private:
 
 class FlightController {
 public:
+    // Creates the roll, pitch, yaw, and sideslip controllers.
     FlightController();
 
+    // Converts course error and ground speed into a desired roll angle.
     void updateGPSCourse(float target_course_rad, float gps_course_rad, float ground_speed_m_s);
 
+    // Converts attitude and rate errors into normalized servo and throttle outputs.
     ServoOutputs updateAttitude(float dt, 
                                 const Quaternion& q_curr, 
                                 const Vector3& gyro_rad_s, 
@@ -100,6 +112,7 @@ public:
                                 const TECSOutputs& tecs);
 
 private:
+    // Wraps an angle into the range [-pi, pi).
     [[nodiscard]] float wrapPi(float angle) const;
 
     float target_roll_rad_ = 0.0f;

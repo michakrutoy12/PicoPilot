@@ -9,10 +9,14 @@ public:
     float temp = 0.0f;
     float gx = 0.0f, gy = 0.0f, gz = 0.0f;
 
+    // Creates an IMU driver for the selected I2C bus and device address.
     MPU6500(i2c_inst_t* i2c, uint8_t address = 0x68);
 
+    // Verifies the device and configures its sampling and interrupt settings.
     bool begin();
+    // Reads and converts the latest accelerometer, temperature, and gyro values.
     bool read_data();
+    // Sets the gyro sample rate and returns the resulting rate.
     float setSampleRate(uint16_t hz);
 
 private:
@@ -31,6 +35,8 @@ private:
     static constexpr float ACCEL_SCALE = 9.80665f / 4096.0f; // ±8g
     static constexpr float GYRO_SCALE  = 0.0174532925f / 65.5f;   // ±500 DPS
 
+    // Writes one value to an IMU register.
     bool writeReg(uint8_t reg, uint8_t value);
+    // Reads one value from an IMU register.
     bool readReg(uint8_t reg, uint8_t& value);
 };

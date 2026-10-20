@@ -10,10 +10,12 @@ struct Vector3f {
     float y{0.0f};
     float z{0.0f};
 
+    // Returns the vector's Euclidean length.
     float norm() const {
         return std::sqrtf(x * x + y * y + z * z);
     }
 
+    // Returns the cross product with another vector.
     Vector3f cross(const Vector3f& v) const {
         return {
             y * v.z - z * v.y,
@@ -36,9 +38,11 @@ struct CentripetalConfig {
 
 class CentripetalCompensator {
 public:
+    // Creates a compensator with the specified sensor geometry and thresholds.
     explicit CentripetalCompensator(const CentripetalConfig& config = CentripetalConfig())
         : config_(config) {}
 
+    // Removes rotational acceleration and adapts accelerometer noise for motion.
     void process(const Vector3f& accel_raw,
                  const Vector3f& gyro_rads,
                  float dt,

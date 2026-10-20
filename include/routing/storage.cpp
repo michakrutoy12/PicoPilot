@@ -28,6 +28,7 @@ struct FlashWriteParameters {
     std::size_t size;
 };
 
+// Erases the route sector and programs its prepared page-aligned contents.
 void write_route_to_flash(void* context) {
     const auto& parameters = *static_cast<const FlashWriteParameters*>(context);
     flash_range_erase(parameters.offset, FLASH_SECTOR_SIZE);
