@@ -402,6 +402,65 @@ void gps_handler() {
     }
 }
 
+void parse_csv_line(char* line, RouteStorage::Waypoint& waypoint) {
+    char* token = strtok(line, ",");
+    if (token != NULL) waypoint.latitude = strtod(token, NULL);
+
+    token = strtok(NULL, ",");
+    if (token != NULL) waypoint.longitude = strtod(token, NULL);
+
+    token = strtok(NULL, ",");
+    if (token != NULL) waypoint.altitude = strtof(token, NULL);
+
+    token = strtok(NULL, ",");
+    if (token != NULL) waypoint.speed = strtof(token, NULL);
+}
+
+bool process_route_rx(RouteStorage::Route& active_route){
+    static char buffer[MAX_CSV_LINE_LENGTH];
+    static uint8_t index = 0;
+    static bool receiving = false;
+    static RouteStorage::Route temp_route {};
+
+    int c = stdio_getchar_timeout_us(0);
+    if(c == PICO_ERROR_TIMEOUT) return false;
+
+    if(c == '\n' || index >= MAX_CSV_LINE_LENGTH - 1){
+        buffer[index] = '\0';
+        bool route_updated = false;
+        
+        if(index > 0){
+            if(strcmp(buffer, "START") == 0){
+                printf("Ready to receive the route.\n");
+                temp_route = {};
+                receiving = true;
+            }
+
+            else if(strcmp(buffer, "END") == 0){
+                if(receiving){
+                    receiving = false;
+                    if(!route_loader.save(temp_route)){
+                        printf("Failed to save the route!\n");
+                        route_updated = false;
+                    } else{
+                        active_route = temp_route;
+                        route_updated = true;
+                    }
+                }
+            } 
+            else if(receiving && temp_route.count < RouteStorage::MAX_WAYPOINTS){
+                parse_csv_line(buffer, temp_route.points[temp_route.count++]);
+            }
+        }
+        index = 0;
+        return route_updated;
+    } else if(c != '\r'){
+        buffer[index++] = (char)c;
+    }
+
+    return false;
+}
+
 void gpio_callback(uint gpio, uint32_t events) {
     if (gpio == PPM_PIN) {
         ppm_handler();
@@ -924,64 +983,6 @@ void core0_entry() {
         }
 #endif
     }
-}
-
-void parse_csv_line(char* line, RouteStorage::Waypoint& waypoint) {
-    char* token = strtok(line, ",");
-    if (token != NULL) waypoint.latitude = strtod(token, NULL);
-
-    token = strtok(NULL, ",");
-    if (token != NULL) waypoint.longitude = strtod(token, NULL);
-
-    token = strtok(NULL, ",");
-    if (token != NULL) waypoint.altitude = strtof(token, NULL);
-
-    token = strtok(NULL, ",");
-    if (token != NULL) waypoint.speed = strtof(token, NULL);
-}
-
-bool process_route_rx(RouteStorage::Route& active_route){
-    static char buffer[MAX_CSV_LINE_LENGTH];
-    static uint8_t index = 0;
-    static bool receiving = false;
-    static RouteStorage::Route temp_route {};
-
-    int c = stdio_getchar_timeout_us(0);
-    if(c == PICO_ERROR_TIMEOUT) return false;
-
-    if(c == '\n' || index >= MAX_CSV_LINE_LENGTH - 1){
-        buffer[index] = '\0';
-        bool route_updated = false;
-        
-        if(index > 0){
-            if(strcmp(buffer, "START") == 0){
-                temp_route = {};
-                receiving = true;
-            }
-
-            else if(strcmp(buffer, "END") == 0){
-                if(receiving){
-                    receiving = false;
-                    if(!route_loader.save(temp_route)){
-                        printf("Failed to save the route!\n");
-                        route_updated = false;
-                    } else{
-                        active_route = temp_route;
-                        route_updated = true;
-                    }
-                }
-            } 
-            else if(receiving && temp_route.count < RouteStorage::MAX_WAYPOINTS){
-                parse_csv_line(buffer, temp_route.points[temp_route.count++]);
-            }
-        }
-        index = 0;
-        return route_updated;
-    } else if(c != '\r'){
-        buffer[index++] = (char)c;
-    }
-
-    return false;
 }
 
 
