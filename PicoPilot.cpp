@@ -67,8 +67,7 @@
 
 bool AUTOPILOT_MODE_ROUTE = false;
 
-const uint8_t BUTTON_PIN = 14;
-const uint8_t MAX_LINE_LENGTH = 64;
+const uint8_t MAX_CSV_LINE_LENGTH = 64;
 
 RouteStorage::RouteLoader route_loader;
 
@@ -606,12 +605,14 @@ void core0_entry() {
     // Disable route mode at startup if flash contains no valid route.
     if (!route_ready) {
         AUTOPILOT_MODE_ROUTE = false;
+        route = {};
     }
 #ifdef PICOPILOT_ENABLE_DIAGNOSTICS
     if (AUTOPILOT_MODE_ROUTE && !route_ready) {
         printf("Route autopilot requested, but no valid route is loaded.\n");
     }
     if (route_loaded) print_route(&route);
+    else printf("No valid route is loaded.");
 #endif
 
     uint32_t last_bme_read_us = 0;
@@ -648,11 +649,18 @@ void core0_entry() {
     while (true) {
         uint32_t now_us = time_us_32();
         // Treat receiver and estimator data as usable only while their heartbeats are fresh.
-        bool signal_ok = ppm_frame_valid &&
-                         (now_us - last_valid_ppm_us) < MAX_NO_SIGNAL_TIME;
+        bool signal_ok = ppm_frame_valid && (now_us - last_valid_ppm_us) < MAX_NO_SIGNAL_TIME;
         bool core1_healthy = (now_us - core1_heartbeat_us) < CORE1_STALE_TIMEOUT_US;
         if (core1_healthy) {
             watchdog_update();
+        }
+
+        if(process_route_rx(route)){
+            router.set_route(route);
+#ifdef PICOPILOT_ENABLE_DIAGNOSTICS
+            printf("Successfully applied a new route with %u points!\n", route.count);
+            print_route(&route);
+#endif
         }
 
         char c;
@@ -934,86 +942,62 @@ void parse_csv_line(char* line, RouteStorage::Waypoint& waypoint) {
     if (token != NULL) waypoint.speed = strtof(token, NULL);
 }
 
+bool process_route_rx(RouteStorage::Route& active_route){
+    static char buffer[MAX_CSV_LINE_LENGTH];
+    static uint8_t index = 0;
+    static bool receiving = false;
+    static RouteStorage::Route temp_route {};
 
-void load_route(){
-    char buffer[MAX_LINE_LENGTH];
-    uint8_t index = 0;
-    bool receiving = false;
+    int c = stdio_getchar_timeout_us(0);
+    if(c == PICO_ERROR_TIMEOUT) return false;
 
-    RouteStorage::Route route {};
-
-    // Receive START, waypoint CSV lines, and END over USB before saving the route.
-    while(true){
-        int c = stdio_getchar_timeout_us(0);
-        if(c == PICO_ERROR_TIMEOUT) continue;
-
-        if(c == '\n' || index >= MAX_LINE_LENGTH - 1){
-            buffer[index] = '\0';
-            
-            if(index > 0){
-                if(strcmp(buffer, "START") == 0){
-                    route.count = 0;
-                    receiving = true;
-                    printf("Ready to receive a route.\n");
-                } 
-
-                else if(strcmp(buffer, "END") == 0){
-                    if(receiving){
-                        if(!route_loader.save(route)){
-                            printf("Failed to save the route!\n");
-                            continue;
-                        }
-                        printf("Successfully saved the route!\n");
-                        break;
-                    }
-                } 
-                else if(receiving && route.count < RouteStorage::MAX_WAYPOINTS){
-                    parse_csv_line(buffer, route.points[route.count++]);
-                }
+    if(c == '\n' || index >= MAX_CSV_LINE_LENGTH - 1){
+        buffer[index] = '\0';
+        bool route_updated = false;
+        
+        if(index > 0){
+            if(strcmp(buffer, "START") == 0){
+                temp_route = {};
+                receiving = true;
             }
-            index = 0;
-        } else if(c != '\r'){
-            buffer[index++] = (char)c;
+
+            else if(strcmp(buffer, "END") == 0){
+                if(receiving){
+                    receiving = false;
+                    if(!route_loader.save(temp_route)){
+                        printf("Failed to save the route!\n");
+                        route_updated = false;
+                    } else{
+                        active_route = temp_route;
+                        route_updated = true;
+                    }
+                }
+            } 
+            else if(receiving && temp_route.count < RouteStorage::MAX_WAYPOINTS){
+                parse_csv_line(buffer, temp_route.points[temp_route.count++]);
+            }
         }
+        index = 0;
+        return route_updated;
+    } else if(c != '\r'){
+        buffer[index++] = (char)c;
     }
+
+    return false;
 }
 
 
 int main() {
     compensator_config.lever_arm_m = lever_arm_m;
-
-    gpio_init(BUTTON_PIN);
-    gpio_set_dir(BUTTON_PIN, GPIO_IN);
-    gpio_pull_up(BUTTON_PIN);
-    
-    uint32_t now_us = time_us_32();
-    bool route_load_mode = false;
-    // Sample the route-load button briefly during startup before initializing PWM.
-    while(time_us_32() - now_us <= 1000000){
-        if(gpio_get(BUTTON_PIN) == 0){
-            route_load_mode = true;
-            break;
-        }
-    }
-
-    if(route_load_mode){
-        stdio_init_all();
-        while (!stdio_usb_connected()) {
-            sleep_ms(100);
-        }
-        printf("USB connected.\n");
-
-        load_route();
-    }
+    stdio_init_all();
 
 #ifdef PICOPILOT_ENABLE_DIAGNOSTICS
-    if(!route_load_mode) stdio_init_all();
-    while (!stdio_usb_connected()) {
+    while(!stdio_usb_connected()){
         sleep_ms(100);
-    }
+    };
 #endif
-    hardware_init();
 
+    hardware_init();
     watchdog_enable(1000, true);
 
     core1_heartbeat_us = time_us_32();

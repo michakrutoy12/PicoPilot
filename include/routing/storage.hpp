@@ -18,10 +18,10 @@ struct Waypoint {
 };
 
 struct Route {
-    uint16_t current_waypoint;
+    uint16_t current_waypoint = 0;
     uint32_t magic = ROUTE_MAGIC;
     uint16_t version = ROUTE_VERSION;
-    uint16_t count;
+    uint16_t count = 0;
     Waypoint points[MAX_WAYPOINTS];
 };
 
