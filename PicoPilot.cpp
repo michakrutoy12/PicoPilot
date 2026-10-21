@@ -307,6 +307,7 @@ void print_sensor_diagnostics(const RawSensorData& sensors, const EKFOutput& ekf
            static_cast<unsigned>(pulses[2]), static_cast<unsigned>(pulses[3]),
            static_cast<unsigned>(pulses[4]), static_cast<unsigned>(pulses[5]));
 }
+#endif
 
 void print_route(const RouteStorage::Route* route) {
     printf("\n--- Route: %u waypoints ---\n", route->count);
@@ -353,7 +354,6 @@ void print_route(const RouteStorage::Route* route) {
 
     printf("\n--- End of route ---\n");
 }
-#endif
 
 void ppm_handler() {
     previousTime = interruptTime;
@@ -657,10 +657,8 @@ void core0_entry() {
 
         if(process_route_rx(route)){
             router.set_route(route);
-#ifdef PICOPILOT_ENABLE_DIAGNOSTICS
             printf("Successfully applied a new route with %u points!\n", route.count);
             print_route(&route);
-#endif
         }
 
         char c;
