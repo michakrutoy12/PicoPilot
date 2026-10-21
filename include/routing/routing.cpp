@@ -5,6 +5,7 @@
 namespace {
 
 constexpr double DEG_TO_RAD = M_PI / 180.0;
+constexpr float ROUTE_ORBIT_RADIUS_M = 60.0f;
 
 } // namespace
 
@@ -54,6 +55,7 @@ bool Router::set_route(const RouteStorage::Route& route) {
     const RouteStorage::RouteLoader route_loader;
     if (!route_loader.validate(route)) {
         route_active = false;
+        route_complete_ = false;
         route_ = RouteStorage::Route {};
         return false;
     }
@@ -61,14 +63,30 @@ bool Router::set_route(const RouteStorage::Route& route) {
     route_ = route;
     route_.current_waypoint = 0;
     route_active = true;
+    route_complete_ = false;
     waypoint_departure_required_ = false;
 
     return true;
 }
 
 void Router::update(const RouterInputs& inputs, RouterOutputs& outputs) {
-    if (route_.current_waypoint >= route_.count) {
-        outputs.route_active = false;
+    if (route_.count == 0 || route_.current_waypoint >= route_.count) {
+        return;
+    }
+
+    if (route_complete_) {
+        const auto& last = route_.points[route_.count - 1];
+        outputs.altitude = last.altitude;
+        outputs.speed = last.speed;
+        outputs.bearing = calculate_orbit_bearing(
+            inputs.lat,
+            inputs.lon,
+            last.latitude,
+            last.longitude,
+            ROUTE_ORBIT_RADIUS_M,
+            true
+        );
+        outputs.route_complete = true;
         return;
     }
 
@@ -117,17 +135,18 @@ void Router::update(const RouterInputs& inputs, RouterOutputs& outputs) {
             ++route_.current_waypoint;
         } else {
             route_active = false;
-            outputs.route_active = false;
-
+            route_complete_ = true;
             outputs.altitude = target.altitude;
             outputs.speed = target.speed;
-            outputs.bearing = calculate_bearing(
+            outputs.bearing = calculate_orbit_bearing(
                 inputs.lat,
                 inputs.lon,
                 target.latitude,
-                target.longitude
+                target.longitude,
+                ROUTE_ORBIT_RADIUS_M,
+                true
             );
-
+            outputs.route_complete = true;
             return;
         }
     }

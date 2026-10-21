@@ -21,6 +21,7 @@ struct RouterOutputs {
     float speed;
     float bearing;
     bool route_active;
+    bool route_complete;
 };
 
 class Router {
@@ -36,6 +37,7 @@ public:
 private:
     RouteStorage::Route route_{};
     bool route_active = false;
+    bool route_complete_ = false;
     bool waypoint_departure_required_ = false;
     double last_reached_latitude_ = 0.0;
     double last_reached_longitude_ = 0.0;

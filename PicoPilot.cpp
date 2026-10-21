@@ -920,7 +920,7 @@ void core0_entry() {
 
                     tecs_in.h_set = nav_out.altitude;
                     tecs_in.v_set = nav_out.speed;
-                    if (nav_out.route_active) {
+                    if (nav_out.route_active || nav_out.route_complete) {
                         desired_course_rad = nav_out.bearing;
                     } else {
                         desired_course_rad = current_sensors.course *
