@@ -68,7 +68,6 @@
 bool AUTOPILOT_MODE_ROUTE = false;
 
 const uint8_t BUTTON_PIN = 14;
-bool route_load_mode = false;
 const uint8_t MAX_LINE_LENGTH = 64;
 
 RouteStorage::RouteLoader route_loader;
@@ -605,7 +604,7 @@ void core0_entry() {
     const bool route_ready = route_loaded && router.set_route(route);
 
     // Disable route mode at startup if flash contains no valid route.
-    if (AUTOPILOT_MODE_ROUTE && !route_ready) {
+    if (!route_ready) {
         AUTOPILOT_MODE_ROUTE = false;
     }
 #ifdef PICOPILOT_ENABLE_DIAGNOSTICS
@@ -629,6 +628,7 @@ void core0_entry() {
     constexpr float RTH_ALTITUDE_CLEARANCE_M = 30.0f;
     constexpr float RTH_ORBIT_RADIUS_M = 60.0f;
     constexpr float RTH_DEFAULT_SPEED_M_S = 15.0f;
+    constexpr float MIN_AUTOPILOT_SPEED = 3.0f;
 
 #ifdef PICOPILOT_ENABLE_DIAGNOSTICS
     constexpr uint32_t DIAGNOSTICS_INTERVAL_US = 1000000;
@@ -723,10 +723,13 @@ void core0_entry() {
                           std::isfinite(current_sensors.lon) &&
                           std::isfinite(current_sensors.speed) &&
                           std::isfinite(current_sensors.course);
-            const bool rth_requested = !signal_ok;
+            const bool sensors_ok_for_autopilot = imu_ok && gps_ok && core1_healthy;
+            const bool can_be_autopilot_on = sensors_ok_for_autopilot && current_sensors.speed >= MIN_AUTOPILOT_SPEED;
+            const bool autopilot_switch_on = pulses[4] >= 1500;
+            const bool rth_requested = !AUTOPILOT_MODE_ROUTE && !signal_ok;
 
             // Capture one RTH altitude target on entry and clear it after signal recovery.
-            if (rth_requested && home_set && !rth_altitude_captured) {
+            if (rth_requested && home_set && can_be_autopilot_on && !rth_altitude_captured) {
                 rth_altitude_m = std::max(
                     ekf.altitude,
                     home_altitude + RTH_ALTITUDE_CLEARANCE_M
@@ -734,7 +737,7 @@ void core0_entry() {
                 rth_altitude_captured = true;
             } else if (!rth_requested) {
                 rth_altitude_captured = false;
-            } // Return to home altitude capture
+            } // Return to home altitude capture.
 
             if (!rth_requested && rth_active) {
                 altitude_hold_captured = false;
@@ -753,34 +756,38 @@ void core0_entry() {
             uint16_t outputs[4];
 
             // Apply safety fallbacks before selecting direct control or an autopilot mode.
-            if (rth_requested && (!home_set || !gps_ok)) {
-                // RTH is not possible without a saved home position and fresh GPS.
+            if (AUTOPILOT_MODE_ROUTE && (!route_ready || !sensors_ok_for_autopilot)) {
+                // Route mode has no manual fallback when its navigation sensors are unavailable.
                 outputs[0] = 1040;
                 outputs[1] = 1500;
                 outputs[2] = 1500;
                 outputs[3] = 1500;
-            } else if (signal_ok && pulses[4] < 1500) {
-                // Direct control
+                altitude_hold_captured = false;
+                course_hold_captured = false;
+            } else if (AUTOPILOT_MODE_ROUTE && signal_ok) {
+                // In route mode, a live RC signal gives direct pilot control.
                 outputs[0] = pulses[2];
                 outputs[1] = pulses[0];
                 outputs[2] = pulses[1];
                 outputs[3] = pulses[3];
                 altitude_hold_captured = false;
                 course_hold_captured = false;
-            } else if (!core1_healthy || !imu_ok) {
-                // Critical Failure
+            } else if (!AUTOPILOT_MODE_ROUTE && rth_requested &&
+                       (!home_set || !can_be_autopilot_on)) {
+                // Do not attempt RTH without a saved home and usable navigation.
                 outputs[0] = 1040;
                 outputs[1] = 1500;
                 outputs[2] = 1500;
                 outputs[3] = 1500;
                 altitude_hold_captured = false;
                 course_hold_captured = false;
-            } else if (AUTOPILOT_MODE_ROUTE && !rth_requested && (!route_ready || !gps_ok)) {
-                // Route mode requires an active route and fresh GPS.
-                outputs[0] = 1040;
-                outputs[1] = 1500;
-                outputs[2] = 1500;
-                outputs[3] = 1500;
+            } else if (!AUTOPILOT_MODE_ROUTE && signal_ok &&
+                       (!sensors_ok_for_autopilot || !autopilot_switch_on)) {
+                // Use the pilot's controls if sensors fail or autopilot is not selected.
+                outputs[0] = pulses[2];
+                outputs[1] = pulses[0];
+                outputs[2] = pulses[1];
+                outputs[3] = pulses[3];
                 altitude_hold_captured = false;
                 course_hold_captured = false;
             } else {
@@ -885,6 +892,14 @@ void core0_entry() {
                 outputs[2] = servo_to_pwm(servos.elevator);
                 outputs[3] = servo_to_pwm(-servos.rudder);
             }
+
+            // GPS speed is the available ground-speed proxy; prevent powered
+            // takeoff while the autopilot switch is selected below this threshold.
+            if (autopilot_switch_on && gps_ok &&
+                current_sensors.speed < MIN_AUTOPILOT_SPEED) {
+                outputs[0] = 1040;
+            }
+
             set_pwm(THROTTLE_PIN, outputs[0]);
             set_pwm(ROLL_PIN, outputs[1]);
             set_pwm(PITCH_PIN, outputs[2]);
@@ -929,7 +944,7 @@ void load_route(){
 
     // Receive START, waypoint CSV lines, and END over USB before saving the route.
     while(true){
-        int c = getchar_timeout_us(0);
+        int c = stdio_getchar_timeout_us(0);
         if(c == PICO_ERROR_TIMEOUT) continue;
 
         if(c == '\n' || index >= MAX_LINE_LENGTH - 1){
@@ -972,6 +987,7 @@ int main() {
     gpio_pull_up(BUTTON_PIN);
     
     uint32_t now_us = time_us_32();
+    bool route_load_mode = false;
     // Sample the route-load button briefly during startup before initializing PWM.
     while(time_us_32() - now_us <= 1000000){
         if(gpio_get(BUTTON_PIN) == 0){
