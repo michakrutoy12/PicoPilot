@@ -441,6 +441,8 @@ bool process_route_rx(RouteStorage::Route& active_route){
             if(strcmp(buffer, "START") == 0){
                 printf("Ready to receive the route.\n");
                 temp_route = {};
+                temp_route.magic = RouteStorage::ROUTE_MAGIC;
+                temp_route.version = RouteStorage::ROUTE_VERSION;
                 receiving = true;
             }
 
@@ -691,7 +693,7 @@ void core0_entry() {
     const uint32_t TELEMETRY_INTERVAL_US = 200000;
 
     uint32_t last_control_time_us = time_us_32();
-    constexpr uint32_t CONTROL_INTERVAL_US = 2500;
+    constexpr uint32_t CONTROL_INTERVAL_US = 10000;
     constexpr uint32_t MAX_IMU_AGE_US = 50000;
     constexpr uint32_t CORE1_STALE_TIMEOUT_US = 100000;
     constexpr uint32_t MAX_GPS_AGE_US = 1500000;
@@ -796,7 +798,6 @@ void core0_entry() {
                           std::isfinite(current_sensors.lon) &&
                           std::isfinite(current_sensors.speed) &&
                           std::isfinite(current_sensors.course);
-
             const bool sensors_ok_for_autopilot = imu_ok && gps_ok && core1_healthy;
             const bool can_be_autopilot_on = sensors_ok_for_autopilot && current_sensors.speed >= MIN_AUTOPILOT_SPEED;
             const bool autopilot_switch_on = pulses[4] >= 1500;

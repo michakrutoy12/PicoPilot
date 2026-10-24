@@ -36,7 +36,7 @@ add_compile_definitions(PICO_STACK_SIZE=0x1000 PICO_CORE1_STACK_SIZE=0x1000)
 # Initialise the Raspberry Pi Pico SDK
 pico_sdk_init()
 
-option(PICOPILOT_ENABLE_DIAGNOSTICS "Enable periodic USB sensor diagnostics" ON)
+option(PICOPILOT_ENABLE_DIAGNOSTICS "Enable periodic USB sensor diagnostics" OFF)
 
 # Add executable. Default name is the project name, version 0.1
 

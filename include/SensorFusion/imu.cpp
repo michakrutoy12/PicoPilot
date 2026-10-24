@@ -186,9 +186,42 @@ void ExtendedKalmanFilter::updateAccel(float ax, float ay, float az) {
         }
     }
 
+    float P_prior[7][7];
+    float temp[7][7];
+    std::memcpy(P_prior, P, sizeof(P_prior));
+
     for (int i = 0; i < 7; i++) {
         for (int j = 0; j < 7; j++) {
-            P[i][j] -= KH[i][0]*P[0][j] + KH[i][1]*P[1][j] + KH[i][2]*P[2][j] + KH[i][3]*P[3][j];
+            temp[i][j] = 0.0f;
+            for (int k = 0; k < 7; k++) {
+                const float a_ik = (i == k ? 1.0f : 0.0f) -
+                                   (k < 4 ? KH[i][k] : 0.0f);
+                temp[i][j] += a_ik * P_prior[k][j];
+            }
+        }
+    }
+
+    for (int i = 0; i < 7; i++) {
+        for (int j = i; j < 7; j++) {
+            float covariance_ij = 0.0f;
+            float covariance_ji = 0.0f;
+            for (int k = 0; k < 7; k++) {
+                const float a_ik = (i == k ? 1.0f : 0.0f) -
+                                   (k < 4 ? KH[i][k] : 0.0f);
+                const float a_jk = (j == k ? 1.0f : 0.0f) -
+                                   (k < 4 ? KH[j][k] : 0.0f);
+                covariance_ij += temp[i][k] * a_jk;
+                covariance_ji += temp[j][k] * a_ik;
+            }
+            for (int k = 0; k < 3; k++) {
+                const float measurement_noise = R_accel * K[i][k] * K[j][k];
+                covariance_ij += measurement_noise;
+                covariance_ji += measurement_noise;
+            }
+
+            const float covariance = 0.5f * (covariance_ij + covariance_ji);
+            P[i][j] = covariance;
+            P[j][i] = covariance;
         }
     }
 }

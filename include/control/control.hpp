@@ -118,10 +118,10 @@ private:
     float target_roll_rad_ = 0.0f;
     
     float k_nav_ = 0.5f;   
-    float k_p_att_ = 3.5f;
+    float k_p_att_ = 4.5f;
 
     float max_rate_roll_  = 2.0f; 
-    float max_rate_pitch_ = 0.45f;
+    float max_rate_pitch_ = 0.875f;
     float max_rate_yaw_   = 0.5f;
 
     PIDController rate_roll_pid_;

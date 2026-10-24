@@ -134,8 +134,8 @@ TECSOutputs TECSController::update(const TECSInputs& in, float dt) {
 }
 
 FlightController::FlightController()
-    : rate_roll_pid_ (0.15f, 0.030f, 0.003f, -1.0f, 1.0f, 0.20f, 0.2f),
-      rate_pitch_pid_(0.15f, 0.05f, 0.007f, -1.0f, 1.0f, 20.0f, 0.2f),
+    : rate_roll_pid_ (0.35f, 0.005f, 0.000f, -1.0f, 1.0f, 0.2f, 0.2f),
+      rate_pitch_pid_(0.40f, 0.005f, 0.000f, -1.0f, 1.0f, 0.2f, 0.2f),
       rate_yaw_pid_  (0.10f, 0.010f, 0.000f, -1.0f, 1.0f, 0.15f, 1.0f),
       sideslip_pid_  (0.01f, 0.000f, 0.000f, -0.5f, 0.5f, 0.10f, 1.0f) 
 {}
