@@ -30,6 +30,9 @@ include(pico_sdk_import.cmake)
 
 project(PicoPilot C CXX ASM)
 
+# Reserve the full 4 KiB scratch bank for each core's stack.
+add_compile_definitions(PICO_STACK_SIZE=0x1000 PICO_CORE1_STACK_SIZE=0x1000)
+
 # Initialise the Raspberry Pi Pico SDK
 pico_sdk_init()
 

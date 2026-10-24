@@ -135,9 +135,16 @@ bool home_set = false;
 
 RawSensorData global_sensor_data;
 spin_lock_t *sensor_lock;
+uint32_t sensor_update_generation = 0;
 
 EKFOutput global_ekf_output;
 spin_lock_t *ekf_lock;
+
+ExtendedKalmanFilter core1_ekf;
+Variometer core1_variometer;
+CentripetalCompensator* core1_compensator = nullptr;
+RouteStorage::Route active_route;
+Avionics::Router active_router;
 
 volatile bool imu_data_ready = false;
 uint32_t imu_irq_timestamp_us = 0;
@@ -228,17 +235,18 @@ void init_telemetry_dma() {
 }
 
 void send_sensors_to_core1(const RawSensorData &data) {
-    // Protect the shared sensor snapshot while handing it to the estimator core.
     uint32_t save = spin_lock_blocking(sensor_lock);
     global_sensor_data = data;
+    ++sensor_update_generation;
     spin_unlock(sensor_lock, save);
+    __sev();
 }
 
-RawSensorData get_sensors_on_core1() {
-    // Copy the latest sensor snapshot without exposing shared state to the caller.
+RawSensorData get_sensors_on_core1(uint32_t &generation) {
     RawSensorData local_copy;
     uint32_t save = spin_lock_blocking(sensor_lock);
     local_copy = global_sensor_data;
+    generation = sensor_update_generation;
     spin_unlock(sensor_lock, save);
     return local_copy;
 }
@@ -558,10 +566,6 @@ void core1_entry() {
         panic("Failed to initialize flash-safe execution on core 1");
     }
 
-    static ExtendedKalmanFilter ekf;
-    static Variometer variometer;
-    static CentripetalCompensator compensator(compensator_config);
-
     RawSensorData sensors;
     EKFOutput ekf_result;
     Vector3f gyro_clean, accel_corr;
@@ -572,11 +576,17 @@ void core1_entry() {
     uint32_t last_baro_timestamp_us = 0;
     uint32_t last_gps_timestamp_us = 0;
     uint32_t loop_counter = 0;
+    uint32_t processed_sensor_generation = 0;
 
     while (true) {
-        multicore_fifo_pop_blocking();
-        multicore_fifo_drain();
-        sensors = get_sensors_on_core1();
+        __wfe();
+        uint32_t sensor_generation;
+        sensors = get_sensors_on_core1(sensor_generation);
+        if (sensor_generation == processed_sensor_generation) {
+            continue;
+        }
+        processed_sensor_generation = sensor_generation;
+        core1_heartbeat_us = time_us_32();
 
         if (last_imu_timestamp_us == 0) {
             last_imu_timestamp_us = sensors.imu_timestamp_us;
@@ -591,7 +601,7 @@ void core1_entry() {
         }
 
         float bx, by, bz;
-        ekf.getGyroBias(bx, by, bz);
+        core1_ekf.getGyroBias(bx, by, bz);
         // Remove estimated gyro bias before correcting rotational acceleration.
         gyro_clean = {
             sensors.gyro.x - bx,
@@ -599,7 +609,7 @@ void core1_entry() {
             sensors.gyro.z - bz
         };
 
-        compensator.process(
+        core1_compensator->process(
             sensors.accel,
             gyro_clean,
             dt,
@@ -609,13 +619,13 @@ void core1_entry() {
         );
 
         // Adapt accelerometer trust, correct yaw drift, then predict attitude from gyro.
-        ekf.set_r_accel(adapted_r);
-        ekf.correctYawDrift(sensors.course * DEG_TO_RAD, sensors.speed, dt);
+        core1_ekf.set_r_accel(adapted_r);
+        core1_ekf.correctYawDrift(sensors.course * DEG_TO_RAD, sensors.speed, dt);
 
-        ekf.predict(gyro_clean.x, gyro_clean.y, gyro_clean.z, dt);
+        core1_ekf.predict(gyro_clean.x, gyro_clean.y, gyro_clean.z, dt);
 
         if (loop_counter % 2 == 0) {
-            ekf.updateAccel(accel_corr.x, accel_corr.y, accel_corr.z);
+            core1_ekf.updateAccel(accel_corr.x, accel_corr.y, accel_corr.z);
         }
 
         // Fuse each new barometer and GPS altitude sample into the variometer.
@@ -625,7 +635,7 @@ void core1_entry() {
 
             if (dt_baro > 0.0f && dt_baro < 0.5f) {
                 float raw_altitude = Variometer::pressure_to_altitude(sensors.pressure);
-                variometer.update_baro(raw_altitude, dt_baro);
+                core1_variometer.update_baro(raw_altitude, dt_baro);
             }
         }
 
@@ -634,13 +644,13 @@ void core1_entry() {
             last_gps_timestamp_us = sensors.gps_timestamp_us;
 
             if (sensors.hdop < 2.0f && dt_gps > 0.0f && dt_gps < 2.0f) {
-                variometer.update_gps(sensors.gps_altitude, dt_gps, sensors.hdop * 2.0f);
+                core1_variometer.update_gps(sensors.gps_altitude, dt_gps, sensors.hdop * 2.0f);
             }
         }
 
-        ekf.getQuaternion(ekf_result.q1, ekf_result.q2, ekf_result.q3, ekf_result.q4);
-        ekf_result.altitude = variometer.get_altitude();
-        ekf_result.vertical_speed = variometer.get_vertical_speed();
+        core1_ekf.getQuaternion(ekf_result.q1, ekf_result.q2, ekf_result.q3, ekf_result.q4);
+        ekf_result.altitude = core1_variometer.get_altitude();
+        ekf_result.vertical_speed = core1_variometer.get_vertical_speed();
 
         loop_counter++;
         send_ekf_to_core0(ekf_result);
@@ -655,8 +665,8 @@ void core0_entry() {
     Avionics::FlightController flight_controller;
     Avionics::TECSController tecs_controller;
 
-    RouteStorage::Route route {};
-    Avionics::Router router;
+    RouteStorage::Route& route = active_route;
+    Avionics::Router& router = active_router;
 
     const bool route_loaded = route_loader.load(route);
     const bool route_ready = route_loaded && router.set_route(route);
@@ -766,8 +776,6 @@ void core0_entry() {
                 current_sensors.imu_timestamp_us = imu_irq_timestamp_us;
 
                 send_sensors_to_core1(current_sensors);
-                if (multicore_fifo_wready())
-                    multicore_fifo_push_blocking(1);
             }
         }
 
@@ -788,6 +796,7 @@ void core0_entry() {
                           std::isfinite(current_sensors.lon) &&
                           std::isfinite(current_sensors.speed) &&
                           std::isfinite(current_sensors.course);
+
             const bool sensors_ok_for_autopilot = imu_ok && gps_ok && core1_healthy;
             const bool can_be_autopilot_on = sensors_ok_for_autopilot && current_sensors.speed >= MIN_AUTOPILOT_SPEED;
             const bool autopilot_switch_on = pulses[4] >= 1500;
@@ -988,6 +997,8 @@ void core0_entry() {
 
 int main() {
     compensator_config.lever_arm_m = lever_arm_m;
+    static CentripetalCompensator compensator(compensator_config);
+    core1_compensator = &compensator;
     stdio_init_all();
 
 #ifdef PICOPILOT_ENABLE_DIAGNOSTICS
