@@ -53,13 +53,13 @@ bool MPU6500::read_data() {
     int16_t raw_gy = (buffer[10] << 8) | buffer[11];
     int16_t raw_gz = (buffer[12] << 8) | buffer[13];
 
-    ax = static_cast<float>(raw_ay) * ACCEL_SCALE;
+    ax = -static_cast<float>(raw_ay) * ACCEL_SCALE;
     ay = static_cast<float>(raw_ax) * ACCEL_SCALE;
     az = static_cast<float>(raw_az) * ACCEL_SCALE;
     
     temp = (static_cast<float>(raw_temp) / 333.87f) + 21.0f;
     
-    gx = static_cast<float>(raw_gy) * GYRO_SCALE;
+    gx = -static_cast<float>(raw_gy) * GYRO_SCALE;
     gy = static_cast<float>(raw_gx) * GYRO_SCALE;
     gz = static_cast<float>(raw_gz) * GYRO_SCALE;
     return true;

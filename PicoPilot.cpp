@@ -622,7 +622,7 @@ void core1_entry() {
 
         // Adapt accelerometer trust, correct yaw drift, then predict attitude from gyro.
         core1_ekf.set_r_accel(adapted_r);
-        core1_ekf.correctYawDrift(sensors.course * DEG_TO_RAD, sensors.speed, dt);
+        core1_ekf.correctYawDrift(-sensors.course * DEG_TO_RAD, sensors.speed, dt);
 
         core1_ekf.predict(gyro_clean.x, gyro_clean.y, gyro_clean.z, dt);
 
@@ -798,6 +798,7 @@ void core0_entry() {
                           std::isfinite(current_sensors.lon) &&
                           std::isfinite(current_sensors.speed) &&
                           std::isfinite(current_sensors.course);
+
             const bool sensors_ok_for_autopilot = imu_ok && gps_ok && core1_healthy;
             const bool can_be_autopilot_on = sensors_ok_for_autopilot && current_sensors.speed >= MIN_AUTOPILOT_SPEED;
             const bool autopilot_switch_on = pulses[4] >= 1500;
@@ -867,13 +868,13 @@ void core0_entry() {
                 course_hold_captured = false;
             } else {
                 Avionics::Quaternion q_curr = {ekf.q1, ekf.q2, ekf.q3, ekf.q4};
-                Avionics::Vector3 gyro_rad_s = {-imu.gx, -imu.gy, imu.gz};
+                Avionics::Vector3 gyro_rad_s = {imu.gx, imu.gy, imu.gz};
                 float yaw_curr_rad = get_yaw_from_quaternion(ekf.q1, ekf.q2, ekf.q3, ekf.q4);
 
                 if (!rth_requested && !AUTOPILOT_MODE_ROUTE && !course_hold_captured) {
                     target_course_rad = gps_ok && current_sensors.speed >= 1.0f
                         ? current_sensors.course * static_cast<float>(DEG_TO_RAD)
-                        : yaw_curr_rad;
+                        : -yaw_curr_rad;
                     course_hold_captured = true;
                 } // Following the current heading in manual mode
 
@@ -942,7 +943,7 @@ void core0_entry() {
                 const float measured_course_rad =
                     gps_ok && current_sensors.speed >= 1.0f
                         ? current_sensors.course * static_cast<float>(DEG_TO_RAD)
-                        : yaw_curr_rad;
+                        : -yaw_curr_rad;
                 flight_controller.updateGPSCourse(
                     desired_course_rad,
                     measured_course_rad,
@@ -964,8 +965,8 @@ void core0_entry() {
                 else outputs[0] = throttle_to_pwm(servos.throttle);
 
                 outputs[1] = servo_to_pwm(-servos.aileron);
-                outputs[2] = servo_to_pwm(servos.elevator);
-                outputs[3] = servo_to_pwm(-servos.rudder);
+                outputs[2] = servo_to_pwm(-servos.elevator);
+                outputs[3] = servo_to_pwm(servos.rudder);
             }
 
             // GPS speed is the available ground-speed proxy; prevent powered

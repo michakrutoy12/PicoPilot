@@ -31,6 +31,8 @@ Receiver channels are read in this order: roll, pitch, throttle, yaw, mode and s
 
 The MPU6500 samples at 100 Hz, while PWM outputs run at 50 Hz. The attitude controller also runs at 100 Hz so it does not repeatedly integrate or differentiate the same IMU sample. Roll and pitch rate PID values are conservative starting points, not flight-tested gains. Verify control directions with the propeller removed, and tune only after safe ground checks.
 
+The MPU6500 axis conversion assumes the sensor is mounted with its -Y axis toward the aircraft nose, +X toward the left wing, and +Z up. Verify this orientation and the resulting attitude and control directions on the assembled airframe.
+
 ## Control modes
 
 `AUTOPILOT_MODE_ROUTE` is `false` by default in the source.

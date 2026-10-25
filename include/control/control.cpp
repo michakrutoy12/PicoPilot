@@ -149,7 +149,7 @@ float FlightController::wrapPi(float angle) const {
 void FlightController::updateGPSCourse(float target_course_rad, float gps_course_rad, float ground_speed_m_s) {
     float course_error = wrapPi(target_course_rad - gps_course_rad);
 
-    float turn_rate_des = k_nav_ * course_error; 
+    float turn_rate_des = k_nav_ * course_error;
     float v_safe = std::max(ground_speed_m_s, 4.0f); 
     
     target_roll_rad_ = std::atanf((v_safe * turn_rate_des) / G_ACCEL);
