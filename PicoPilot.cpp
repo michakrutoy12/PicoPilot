@@ -76,7 +76,7 @@ int telemetry_dma_chan = -1;
 MPU6500 imu(I2C_PORT);
 BME280 bme(I2C_PORT, 0x76);
 Neo6M gps;
-RingBuffer<384> gps_ring_buffer;
+RingBuffer<1024> gps_ring_buffer;
 
 CentripetalConfig compensator_config;
 const Vector3f lever_arm_m = {0.17f, 0.03f, 0.0f};
@@ -429,6 +429,8 @@ bool process_route_rx(RouteStorage::Route& active_route){
     static uint8_t index = 0;
     static bool receiving = false;
     static RouteStorage::Route temp_route {};
+
+    if (!stdio_usb_connected()) return false;
 
     int c = stdio_getchar_timeout_us(0);
     if(c == PICO_ERROR_TIMEOUT) return false;
