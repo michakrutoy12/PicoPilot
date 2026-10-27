@@ -734,7 +734,6 @@ void core0_entry() {
     float target_course_rad = 0.0f;
     bool course_hold_captured = false;
     uint32_t last_filtered_ppm_frame_us = 0;
-    bool has_filtered_ppm_frame = false;
     float last_speed_target_m_s = RTH_DEFAULT_SPEED_M_S;
     float rth_altitude_m = 0.0f;
     bool rth_altitude_captured = false;
@@ -744,35 +743,17 @@ void core0_entry() {
     while (true) {
         uint32_t now_us = time_us_32();
         if (ppm_frame_valid && last_valid_ppm_us != last_filtered_ppm_frame_us) {
-            uint16_t frame_pulses[N_CHANNELS];
-            uint32_t frame_time_us;
-            const uint32_t irq_state = save_and_disable_interrupts();
-            frame_time_us = last_valid_ppm_us;
-            for (uint8_t i = 0; i < N_CHANNELS; ++i) {
-                frame_pulses[i] = pulses[i];
-            }
-            restore_interrupts(irq_state);
-
-            if (frame_time_us != last_filtered_ppm_frame_us) {
-                if (has_filtered_ppm_frame) {
-                    const float dt = static_cast<float>(
-                        frame_time_us - last_filtered_ppm_frame_us
-                    ) / 1000000.0f;
-                    for (uint8_t i = 0; i < N_CHANNELS; ++i) {
-                        filtered_pulses[i] = low_pass_filter(
-                            static_cast<float>(frame_pulses[i]),
-                            filtered_pulses[i],
-                            dt,
-                            channels_filter_tau_seconds[i]
-                        );
-                    }
-                } else {
-                    for (uint8_t i = 0; i < N_CHANNELS; ++i) {
-                        filtered_pulses[i] = static_cast<float>(frame_pulses[i]);
-                    }
-                    has_filtered_ppm_frame = true;
-                }
-                last_filtered_ppm_frame_us = frame_time_us;
+            const float dt = static_cast<float>(
+                last_valid_ppm_us - last_filtered_ppm_frame_us
+            ) / 1000000.0f;
+            for (uint8_t i = 0; i < N_CHANNELS; i++) {
+                filtered_pulses[i] = low_pass_filter(
+                    static_cast<float>(pulses[i]),
+                    filtered_pulses[i],
+                    dt,
+                    channels_filter_tau_seconds[i]
+                );
+            last_filtered_ppm_frame_us = last_valid_ppm_us;
             }
         }
 
@@ -1030,8 +1011,7 @@ void core0_entry() {
 
             // GPS speed is the available ground-speed proxy; prevent powered
             // takeoff while the autopilot switch is selected below this threshold.
-            if (autopilot_switch_on && gps_ok &&
-                current_sensors.speed < MIN_AUTOPILOT_SPEED) {
+            if (autopilot_switch_on && current_sensors.speed < MIN_AUTOPILOT_SPEED) {
                 outputs[0] = 1040;
             }
 
