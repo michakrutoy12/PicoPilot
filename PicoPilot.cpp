@@ -48,7 +48,7 @@
 #define PAUSE_PULSE_MAX_LENGTH 20000
 
 #define SIGNAL_POWER_THRESHOLD 1400
-#define MAX_NO_SIGNAL_TIME 2000000
+#define MAX_NO_SIGNAL_TIME 500000
 /* ==================== */
 
 /* GPS RECIVER/FEEDBACK TRANSIVER SETTINGS */
@@ -158,6 +158,9 @@ volatile uint16_t ppm_capture[N_CHANNELS] = {};
 volatile bool ppm_frame_valid = false;
 volatile uint32_t last_valid_ppm_us = 0;
 volatile uint32_t interruptTime, previousTime = 0;
+// Low-Pass Filter
+const float channels_filter_tau_seconds[N_CHANNELS] = {0.03f, 0.03f, 0.1f, 0.03f, 0.0f, 0.05f};
+float filtered_pulses[N_CHANNELS] = {1500.0f, 1500.0f, 1040.0f, 1500.0f, 1500.0f, 1500.0f};
 /* === */
 
 static TelemetryPacket tx_packet_buffer;
@@ -170,11 +173,28 @@ float map(float x, float in_min, float in_max, float out_min, float out_max) {
 
 uint8_t calculate_checksum(const uint8_t *data, size_t len) {
     uint8_t crc = 0x00;
-    for (size_t i = 0; i < len; ++i)
-    {
+    for (size_t i = 0; i < len; ++i) {
         crc ^= data[i];
     }
     return crc;
+}
+
+float low_pass_filter(float input, float& previous, float dt, float tau) {
+    if (!std::isfinite(input) ||
+        !std::isfinite(dt) ||
+        dt <= 0.0f) {
+        return previous;
+    }
+
+    if (tau <= 0.0f) {
+        previous = input;
+        return input;
+    }
+
+    const float alpha = 1.0f - std::exp(-dt / tau);
+    previous += alpha * (input - previous);
+
+    return previous;
 }
 
 void send_telemetry_dma(const RawSensorData &sensors, const EKFOutput &ekf) {
@@ -311,9 +331,9 @@ void print_sensor_diagnostics(const RawSensorData& sensors, const EKFOutput& ekf
            ekf.q1, ekf.q2, ekf.q3, ekf.q4, ekf.altitude, ekf.vertical_speed);
     printf("PPM valid=%s channels[roll,pitch,throttle,yaw,mode,speed]=%u %u %u %u %u %u us\n",
            signal_ok ? "yes" : "no",
-           static_cast<unsigned>(pulses[0]), static_cast<unsigned>(pulses[1]),
-           static_cast<unsigned>(pulses[2]), static_cast<unsigned>(pulses[3]),
-           static_cast<unsigned>(pulses[4]), static_cast<unsigned>(pulses[5]));
+           static_cast<unsigned>(filtered_pulses[0]), static_cast<unsigned>(filtered_pulses[1]),
+           static_cast<unsigned>(filtered_pulses[2]), static_cast<unsigned>(filtered_pulses[3]),
+           static_cast<unsigned>(filtered_pulses[4]), static_cast<unsigned>(filtered_pulses[5]));
 }
 #endif
 
@@ -702,7 +722,7 @@ void core0_entry() {
     constexpr float RTH_ALTITUDE_CLEARANCE_M = 30.0f;
     constexpr float RTH_ORBIT_RADIUS_M = 60.0f;
     constexpr float RTH_DEFAULT_SPEED_M_S = 15.0f;
-    constexpr float MIN_AUTOPILOT_SPEED = 3.0f;
+    constexpr float MIN_AUTOPILOT_SPEED = 2.0f;
 
 #ifdef PICOPILOT_ENABLE_DIAGNOSTICS
     constexpr uint32_t DIAGNOSTICS_INTERVAL_US = 1000000;
@@ -713,6 +733,8 @@ void core0_entry() {
     bool altitude_hold_captured = false;
     float target_course_rad = 0.0f;
     bool course_hold_captured = false;
+    uint32_t last_filtered_ppm_frame_us = 0;
+    bool has_filtered_ppm_frame = false;
     float last_speed_target_m_s = RTH_DEFAULT_SPEED_M_S;
     float rth_altitude_m = 0.0f;
     bool rth_altitude_captured = false;
@@ -721,6 +743,39 @@ void core0_entry() {
 
     while (true) {
         uint32_t now_us = time_us_32();
+        if (ppm_frame_valid && last_valid_ppm_us != last_filtered_ppm_frame_us) {
+            uint16_t frame_pulses[N_CHANNELS];
+            uint32_t frame_time_us;
+            const uint32_t irq_state = save_and_disable_interrupts();
+            frame_time_us = last_valid_ppm_us;
+            for (uint8_t i = 0; i < N_CHANNELS; ++i) {
+                frame_pulses[i] = pulses[i];
+            }
+            restore_interrupts(irq_state);
+
+            if (frame_time_us != last_filtered_ppm_frame_us) {
+                if (has_filtered_ppm_frame) {
+                    const float dt = static_cast<float>(
+                        frame_time_us - last_filtered_ppm_frame_us
+                    ) / 1000000.0f;
+                    for (uint8_t i = 0; i < N_CHANNELS; ++i) {
+                        filtered_pulses[i] = low_pass_filter(
+                            static_cast<float>(frame_pulses[i]),
+                            filtered_pulses[i],
+                            dt,
+                            channels_filter_tau_seconds[i]
+                        );
+                    }
+                } else {
+                    for (uint8_t i = 0; i < N_CHANNELS; ++i) {
+                        filtered_pulses[i] = static_cast<float>(frame_pulses[i]);
+                    }
+                    has_filtered_ppm_frame = true;
+                }
+                last_filtered_ppm_frame_us = frame_time_us;
+            }
+        }
+
         // Treat receiver and estimator data as usable only while their heartbeats are fresh.
         bool signal_ok = ppm_frame_valid && (now_us - last_valid_ppm_us) < MAX_NO_SIGNAL_TIME;
         bool core1_healthy = (now_us - core1_heartbeat_us) < CORE1_STALE_TIMEOUT_US;
@@ -803,7 +858,7 @@ void core0_entry() {
 
             const bool sensors_ok_for_autopilot = imu_ok && gps_ok && core1_healthy;
             const bool can_be_autopilot_on = sensors_ok_for_autopilot && current_sensors.speed >= MIN_AUTOPILOT_SPEED;
-            const bool autopilot_switch_on = pulses[4] >= 1500;
+            const bool autopilot_switch_on = filtered_pulses[4] >= 1500.0f;
             const bool rth_requested = !AUTOPILOT_MODE_ROUTE && !signal_ok;
 
             // Capture one RTH altitude target on entry and clear it after signal recovery.
@@ -823,9 +878,9 @@ void core0_entry() {
             } // Capture canceling when rth is not longer needed.
             rth_active = rth_requested;
 
-            if (signal_ok && pulses[5] >= 1200) {
+            if (signal_ok && filtered_pulses[5] >= 1200.0f) {
                 last_speed_target_m_s = std::clamp(
-                    map(pulses[5], 900.0f, 2200.0f, 0.0f, 27.0f),
+                    map(filtered_pulses[5], 900.0f, 2200.0f, 0.0f, 27.0f),
                     0.0f,
                     27.0f
                 );
@@ -844,10 +899,10 @@ void core0_entry() {
                 course_hold_captured = false;
             } else if (AUTOPILOT_MODE_ROUTE && signal_ok) {
                 // In route mode, a live RC signal gives direct pilot control.
-                outputs[0] = pulses[2];
-                outputs[1] = pulses[0];
-                outputs[2] = pulses[1];
-                outputs[3] = pulses[3];
+                outputs[0] = static_cast<uint16_t>(filtered_pulses[2]);
+                outputs[1] = static_cast<uint16_t>(filtered_pulses[0]);
+                outputs[2] = static_cast<uint16_t>(filtered_pulses[1]);
+                outputs[3] = static_cast<uint16_t>(filtered_pulses[3]);
                 altitude_hold_captured = false;
                 course_hold_captured = false;
             } else if (!AUTOPILOT_MODE_ROUTE && rth_requested &&
@@ -862,10 +917,10 @@ void core0_entry() {
             } else if (!AUTOPILOT_MODE_ROUTE && signal_ok &&
                        (!sensors_ok_for_autopilot || !autopilot_switch_on)) {
                 // Use the pilot's controls if sensors fail or autopilot is not selected.
-                outputs[0] = pulses[2];
-                outputs[1] = pulses[0];
-                outputs[2] = pulses[1];
-                outputs[3] = pulses[3];
+                outputs[0] = static_cast<uint16_t>(filtered_pulses[2]);
+                outputs[1] = static_cast<uint16_t>(filtered_pulses[0]);
+                outputs[2] = static_cast<uint16_t>(filtered_pulses[1]);
+                outputs[3] = static_cast<uint16_t>(filtered_pulses[3]);
                 altitude_hold_captured = false;
                 course_hold_captured = false;
             } else {
@@ -963,7 +1018,9 @@ void core0_entry() {
                     tecs_out
                 );
 
-                if (!use_tecs_throttle && pulses[5] < 1200) outputs[0] = pulses[2];
+                if (!use_tecs_throttle && filtered_pulses[5] < 1200.0f) {
+                    outputs[0] = static_cast<uint16_t>(filtered_pulses[2]);
+                }
                 else outputs[0] = throttle_to_pwm(servos.throttle);
 
                 outputs[1] = servo_to_pwm(-servos.aileron);
