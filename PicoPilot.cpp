@@ -101,6 +101,11 @@ struct TelemetryPacket {
     float hdop;
     uint8_t satellites;
 
+    uint32_t date;
+    uint32_t time;
+
+    uint16_t pulses[N_CHANNELS];
+
     uint8_t checksum;
 };
 #pragma pack(pop)
@@ -120,6 +125,9 @@ struct RawSensorData {
     float speed;
     float course;
     float hdop;
+    uint32_t gps_date;
+    uint32_t gps_time;
+
     uint8_t satellites;
 };
 
@@ -218,12 +226,18 @@ void send_telemetry_dma(const RawSensorData &sensors, const EKFOutput &ekf) {
     memcpy(&tx_packet_buffer.course, &sensors.course, sizeof(float));
     memcpy(&tx_packet_buffer.hdop, &sensors.hdop, sizeof(float));
     
-    tx_packet_buffer.satellites = sensors.satellites;
-    tx_packet_buffer.home_set = home_set;
+    memcpy(&tx_packet_buffer.satellites, &sensors.satellites, sizeof(uint8_t));
+    memcpy(&tx_packet_buffer.home_set, &home_set, sizeof(bool));
 
     memcpy(&tx_packet_buffer.lat, &sensors.lat, sizeof(double));
     memcpy(&tx_packet_buffer.lon, &sensors.lon, sizeof(double));
     memcpy(&tx_packet_buffer.home_distance, &sensors.home_distance, sizeof(float));
+    memcpy(&tx_packet_buffer.date, &sensors.gps_date, sizeof(uint32_t));
+    memcpy(&tx_packet_buffer.time, &sensors.gps_time, sizeof(uint32_t));
+
+    for (uint8_t i = 0; i < N_CHANNELS; ++i) {
+        tx_packet_buffer.pulses[i] = pulses[i];
+    }
 
     uint8_t *ptr = reinterpret_cast<uint8_t *>(&tx_packet_buffer);
     size_t payload_len = sizeof(TelemetryPacket) - 3;
@@ -793,6 +807,8 @@ void core0_entry() {
                 current_sensors.satellites = gps.satellites;
                 current_sensors.lat = gps.latitude;
                 current_sensors.lon = gps.longitude;
+                current_sensors.gps_date = gps.date;
+                current_sensors.gps_time = gps.time;
 
                 float home_distance = 0.0f;
                 if (home_set) home_distance = calculate_distance(home_lat, home_lon, gps.latitude, gps.longitude);

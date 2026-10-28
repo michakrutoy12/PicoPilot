@@ -15,8 +15,8 @@ public:
     float hdop = 0.0f;
     float course = 0.0f;
 
-    uint gps_time = 0;
-    uint gps_date = 0;
+    uint32_t time = 0;
+    uint32_t date = 0;
 
     // Creates a parser with a reserved buffer for incoming NMEA sentences.
     Neo6M();
