@@ -1027,7 +1027,7 @@ void core0_entry() {
 
             // GPS speed is the available ground-speed proxy; prevent powered
             // takeoff while the autopilot switch is selected below this threshold.
-            if (autopilot_switch_on && current_sensors.speed < MIN_AUTOPILOT_SPEED) {
+            if (autopilot_switch_on && gps_ok && current_sensors.speed < MIN_AUTOPILOT_SPEED) {
                 outputs[0] = 1040;
             }
 
